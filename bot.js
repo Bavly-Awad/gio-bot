@@ -70,7 +70,7 @@ async function saveState() {
 
 // ---------- XP / leveling ----------
 const xpToNext = (lvl) => 5 * lvl * lvl + 50 * lvl + 100;
-const LEVEL_REWARDS = { 10: 'OG Fan' }; // level -> role name fragment
+const LEVEL_REWARDS = { 5: 'Regular', 10: 'OG Fan', 25: 'Legend', 50: 'Day One' }; // level -> role name fragment
 
 async function grantXp(msg) {
   const g = msg.guildId, u = msg.author.id;
@@ -176,6 +176,86 @@ async function growthTick(client) {
   } catch (e) { log('growth error: ' + e.message); }
 }
 
+// ---------- invite tracking ----------
+const inviteCache = {}; // guildId -> Map(code -> {uses, inviterId})
+
+async function cacheInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    inviteCache[guild.id] = new Map(invites.map((i) => [i.code, { uses: i.uses, inviterId: i.inviter?.id }]));
+  } catch (e) { log(`invite cache failed for ${guild.id}: ${e.message}`); }
+}
+
+async function attributeJoin(member) {
+  try {
+    const before = inviteCache[member.guild.id];
+    const invites = await member.guild.invites.fetch();
+    let used = null;
+    for (const inv of invites.values()) {
+      const prev = before?.get(inv.code);
+      if (prev && inv.uses > prev.uses) { used = inv; break; }
+      if (!prev && inv.uses > 0) used = used || inv;
+    }
+    inviteCache[member.guild.id] = new Map(invites.map((i) => [i.code, { uses: i.uses, inviterId: i.inviter?.id }]));
+    if (!used?.inviter) return null;
+    state.invites = state.invites || {};
+    state.invites[member.guild.id] = state.invites[member.guild.id] || {};
+    const n = (state.invites[member.guild.id][used.inviter.id] || 0) + 1;
+    state.invites[member.guild.id][used.inviter.id] = n;
+    dirty = true;
+    const staff = member.guild.channels.cache.find((c) => c.name.includes('staff-chat'));
+    if (staff) await staff.send({
+      content: `📨 <@${member.id}> joined via \`${used.code}\` from <@${used.inviter.id}> (their **${n}${n === 1 ? 'st' : n === 2 ? 'nd' : n === 3 ? 'rd' : 'th'}** invite)`,
+      allowedMentions: { parse: [] },
+    }).catch(() => {});
+    return used.inviter.id;
+  } catch (e) { log('attributeJoin error: ' + e.message); return null; }
+}
+
+// ---------- weekly community hangout event ----------
+function nextFriday7pmToronto() {
+  for (let d = 0; d <= 7; d++) {
+    const cand = new Date(Date.now() + d * 86400000);
+    if (cand.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'short' }) !== 'Fri') continue;
+    const ymd = cand.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+    let dt = new Date(`${ymd}T19:00:00-04:00`);
+    const h = Number(dt.toLocaleString('en-US', { timeZone: 'America/Toronto', hour: 'numeric', hour12: false }));
+    if (h !== 19) dt = new Date(`${ymd}T19:00:00-05:00`);
+    if (dt.getTime() > Date.now() + 60 * 60 * 1000) return dt;
+  }
+  return null;
+}
+
+let lastEventCheck = 0;
+async function hangoutTick(client) {
+  if (Date.now() - lastEventCheck < 6 * 60 * 60 * 1000) return; // check every 6h
+  lastEventCheck = Date.now();
+  for (const gid of GUILDS) {
+    try {
+      const guild = await client.guilds.fetch(gid).catch(() => null);
+      if (!guild) continue;
+      const events = await guild.scheduledEvents.fetch();
+      if (events.some((e) => e.name.includes('Community Hangout') && e.status !== 3)) continue;
+      const start = nextFriday7pmToronto();
+      if (!start) continue;
+      const chs = await guild.channels.fetch();
+      const vc = chs.find((c) => c && c.type === ChannelType.GuildVoice && (c.name.includes('LOUNGE') || c.name.includes('Lounge')))
+        || chs.find((c) => c && c.type === ChannelType.GuildVoice);
+      if (!vc) continue;
+      await guild.scheduledEvents.create({
+        name: '🎉 Community Hangout',
+        scheduledStartTime: start,
+        scheduledEndTime: new Date(start.getTime() + 2 * 60 * 60 * 1000),
+        privacyLevel: 2,
+        entityType: 2,
+        channel: vc.id,
+        description: 'Weekly hangout — pull up, chat, game, chill. Everyone welcome. 👑',
+      });
+      log(`hangout event created in ${gid} for ${start.toISOString()}`);
+    } catch (e) { log('hangout error: ' + e.message); }
+  }
+}
+
 // ---------- tiktok stats ----------
 async function tiktokStats() {
   const info = await (await fetch(
@@ -201,8 +281,9 @@ async function tiktokStats() {
 const FULL_INTENTS = [
   GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
   GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildInvites,
 ];
-const BASIC_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+const BASIC_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildInvites];
 let privileged = true;
 
 const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
@@ -219,8 +300,16 @@ async function start(intents) {
     setP(); setInterval(setP, 60 * 60 * 1000);
     await loadState(client);
     await registerCommands(client);
-    const tick = () => { growthTick(client); qotdTick(client); saveState(); };
+    for (const gid of GUILDS) {
+      const guild = await client.guilds.fetch(gid).catch(() => null);
+      if (guild) await cacheInvites(guild);
+    }
+    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); saveState(); };
     tick(); setInterval(tick, 5 * 60 * 1000);
+  });
+
+  client.on('inviteCreate', (inv) => {
+    if (inv.guild) cacheInvites(inv.guild);
   });
 
   client.on('messageCreate', async (msg) => {
@@ -244,6 +333,7 @@ async function start(intents) {
 
   client.on('guildMemberAdd', async (member) => {
     try {
+      await attributeJoin(member);
       const ch = member.guild.channels.cache.find((c) => c.name === '👋-welcome');
       if (ch) await ch.send({
         content: `👑 Yo <@${member.id}>, welcome to **${member.guild.name}**! Grab your ping roles in **Channels & Roles** and say what's up in chat. 🤝`,
@@ -317,6 +407,13 @@ async function start(intents) {
           await i.editReply('TikTok stats are unavailable right now — try again in a bit. 😬');
         }
 
+      } else if (cmd === 'invites') {
+        const board = Object.entries(state.invites?.[i.guildId] || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        if (!board.length) return i.reply('No tracked invites yet — share the server link and climb the board! 📨');
+        const medals = ['🥇', '🥈', '🥉'];
+        const lines = board.map(([id, n], x) => `${medals[x] || `**${x + 1}.**`} <@${id}> — **${n}** invite${n === 1 ? '' : 's'}`);
+        await i.reply({ content: `📨 **Invite Leaderboard**\n${lines.join('\n')}`, allowedMentions: { parse: [] } });
+
       } else if (cmd === 'purge') {
         const amount = i.options.getInteger('amount', true);
         const deleted = await i.channel.bulkDelete(amount, true);
@@ -362,6 +459,7 @@ async function registerCommands(client) {
       .addUserOption((o) => o.setName('user').setDescription('Check someone else')),
     new SlashCommandBuilder().setName('levels').setDescription('Server XP leaderboard'),
     new SlashCommandBuilder().setName('gio').setDescription("Gio's live TikTok stats"),
+    new SlashCommandBuilder().setName('invites').setDescription('Who has invited the most people'),
     new SlashCommandBuilder().setName('purge').setDescription('Delete recent messages (mods only)')
       .addIntegerOption((o) => o.setName('amount').setDescription('How many (1-100)').setRequired(true).setMinValue(1).setMaxValue(100))
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
