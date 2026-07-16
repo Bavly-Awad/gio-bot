@@ -265,15 +265,20 @@ async function tiktokStats() {
   )).json();
   const u = info?.data?.user, s = info?.data?.stats;
   if (!s) throw new Error('tiktok api unavailable');
-  const posts = await (await fetch(
-    `https://www.tikwm.com/api/user/posts?unique_id=${TIKTOK_USER}&count=1`,
-    { headers: { 'User-Agent': 'Mozilla/5.0' } }
-  )).json().catch(() => null);
-  const latest = posts?.data?.videos?.[0];
+  // tikwm's user/posts is usually Cloudflare-challenged; rss-bridge serves the real feed.
+  let latest = null;
+  try {
+    const feed = await (await fetch(
+      `https://rss-bridge.org/bridge01/?action=display&bridge=TikTokBridge&context=By+user&username=${TIKTOK_USER}&format=Json`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(15000) }
+    )).json();
+    const it = feed?.items?.[0];
+    if (it?.url) latest = { url: it.url, title: (it.title || '').trim() };
+  } catch {}
   return {
     followers: s.followerCount, hearts: s.heartCount, videos: s.videoCount,
     bio: u?.signature || '',
-    latest: latest ? `https://www.tiktok.com/@${TIKTOK_USER}/video/${latest.video_id}` : null,
+    latest: latest?.url || null,
     latestTitle: latest?.title || '',
   };
 }
