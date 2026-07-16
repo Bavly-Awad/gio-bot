@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: gio-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node bot.js
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GUILD_ID
+        value: "1521507809206997002"
