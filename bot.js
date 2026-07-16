@@ -9,8 +9,9 @@ const {
   SlashCommandBuilder, MessageFlags, PermissionFlagsBits, ChannelType,
 } = require('discord.js');
 
-const GUILDS = [process.env.GUILD_ID || '1521507809206997002', '1527114619829620736'];
+const GUILDS = ['1527114619829620736']; // main server only
 const DATA_GUILD = '1527114619829620736';
+const AUTO_ROLE = 'lightskin'; // granted to every new member
 const TIKTOK_USER = 'lightskin.gio';
 const LOG = path.join(__dirname, 'bot.log');
 const log = (m) => {
@@ -314,7 +315,7 @@ async function start(intents) {
 
   client.on('messageCreate', async (msg) => {
     try {
-      if (msg.author?.bot || !msg.inGuild()) return;
+      if (msg.author?.bot || !msg.inGuild() || !GUILDS.includes(msg.guildId)) return;
       if (!msg.channel.isThread()) {
         const name = msg.channel.name || '';
         if (name.includes('ideas')) {
@@ -333,6 +334,9 @@ async function start(intents) {
 
   client.on('guildMemberAdd', async (member) => {
     try {
+      if (!GUILDS.includes(member.guild.id)) return;
+      const autoRole = member.guild.roles.cache.find((r) => r.name === AUTO_ROLE);
+      if (autoRole) await member.roles.add(autoRole).catch((e) => log('autorole error: ' + e.message));
       await attributeJoin(member);
       const ch = member.guild.channels.cache.find((c) => c.name === '👋-welcome');
       if (ch) await ch.send({
