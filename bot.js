@@ -7,6 +7,7 @@ const http = require('node:http');
 const {
   Client, GatewayIntentBits, ActivityType, REST, Routes,
   SlashCommandBuilder, MessageFlags, PermissionFlagsBits, ChannelType,
+  Events, AuditLogEvent,
 } = require('discord.js');
 
 const GUILDS = ['1527114619829620736']; // main server only
@@ -177,6 +178,81 @@ async function growthTick(client) {
   } catch (e) { log('growth error: ' + e.message); }
 }
 
+// ---------- anti-nuke ----------
+// Catches a compromised admin / rogue mod destroying the server: mass channel or
+// role deletion, mass bans/kicks, webhook spam. AutoMod covers spam, not destruction.
+//
+// Response is quarantine (strip every role), not ban: it stops the damage instantly,
+// it's reversible if it ever misfires, and it works even when the account is stolen
+// rather than malicious. Hard limits worth knowing:
+//   - Discord never lets a bot act on the server OWNER -> owner actions alert only.
+//   - The bot can only strip roles BELOW its own role.
+const ANTINUKE = {
+  [AuditLogEvent.ChannelDelete]: { label: 'channel deletions', max: 3, windowMs: 30_000 },
+  [AuditLogEvent.RoleDelete]: { label: 'role deletions', max: 3, windowMs: 30_000 },
+  [AuditLogEvent.MemberBanAdd]: { label: 'bans', max: 5, windowMs: 60_000 },
+  [AuditLogEvent.MemberKick]: { label: 'kicks', max: 5, windowMs: 60_000 },
+  [AuditLogEvent.WebhookCreate]: { label: 'webhook creations', max: 5, windowMs: 30_000 },
+  [AuditLogEvent.ChannelCreate]: { label: 'channel creations', max: 8, windowMs: 30_000 },
+};
+// Accounts exempt from anti-nuke. Keep this SMALL — every id here is a key to the server.
+const NUKE_WHITELIST = (process.env.ANTINUKE_WHITELIST || '').split(',').map((s) => s.trim()).filter(Boolean);
+const nukeHits = new Map(); // `${userId}:${action}` -> [timestamps]
+
+async function onAuditEntry(entry, guild, client) {
+  try {
+    const rule = ANTINUKE[entry.action];
+    if (!rule) return;
+    const uid = entry.executorId;
+    if (!uid) return;
+    if (uid === client.user.id) return;      // our own automation
+    if (NUKE_WHITELIST.includes(uid)) return;
+
+    const isOwner = uid === guild.ownerId;
+    const key = `${uid}:${entry.action}`;
+    const now = Date.now();
+    const hits = (nukeHits.get(key) || []).filter((t) => now - t < rule.windowMs);
+    hits.push(now);
+    nukeHits.set(key, hits);
+    if (hits.length < rule.max) return;
+
+    nukeHits.set(key, []); // reset so one incident doesn't alert repeatedly
+    const secs = Math.round(rule.windowMs / 1000);
+    log(`ANTI-NUKE: ${uid} hit ${hits.length} ${rule.label} in ${secs}s (owner=${isOwner})`);
+
+    let outcome;
+    if (isOwner) {
+      outcome = '⚠️ This is the **server owner** — Discord does not allow a bot to act on them. Manual review required.';
+    } else {
+      const member = await guild.members.fetch(uid).catch(() => null);
+      if (!member) outcome = '⚠️ Could not fetch the member to quarantine them.';
+      else if (!member.manageable) outcome = '⚠️ Could not quarantine — their role sits above mine. Move **Gio Bot** higher in Server Settings → Roles.';
+      else {
+        const had = [...member.roles.cache.filter((r) => r.id !== guild.id).values()];
+        await member.roles.set([], `anti-nuke: ${hits.length} ${rule.label} in ${secs}s`);
+        outcome = `🔒 **Quarantined** — stripped ${had.length} role(s): ${had.map((r) => r.name).join(', ') || 'none'}`;
+        state.nuke = state.nuke || [];
+        state.nuke.push({ at: new Date().toISOString(), user: uid, action: rule.label, count: hits.length, roles: had.map((r) => r.id) });
+        dirty = true;
+      }
+    }
+
+    const chs = await guild.channels.fetch();
+    const alertCh = chs.find((c) => c && c.name.includes('mod-logs')) || chs.find((c) => c && c.name.includes('staff-chat'));
+    const adminRole = guild.roles.cache.find((r) => r.name === 'ADMIN');
+    if (alertCh) {
+      await alertCh.send({
+        content: `${adminRole ? `<@&${adminRole.id}> ` : ''}🚨 **ANTI-NUKE TRIGGERED**\n` +
+          `**Who:** <@${uid}> (\`${uid}\`)\n` +
+          `**What:** ${hits.length} ${rule.label} in ${secs}s\n` +
+          `**Action:** ${outcome}\n\n` +
+          `If this was legitimate, restore their roles manually — and consider whitelisting them.`,
+        allowedMentions: { roles: adminRole ? [adminRole.id] : [], users: [] },
+      }).catch((e) => log('anti-nuke alert failed: ' + e.message));
+    }
+  } catch (e) { log('anti-nuke error: ' + e.message); }
+}
+
 // ---------- invite tracking ----------
 const inviteCache = {}; // guildId -> Map(code -> {uses, inviterId})
 
@@ -286,10 +362,14 @@ async function tiktokStats() {
 // ---------- client ----------
 const FULL_INTENTS = [
   GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildModeration, // required for audit-log events (anti-nuke)
   GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent,
   GatewayIntentBits.GuildInvites,
 ];
-const BASIC_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildInvites];
+const BASIC_INTENTS = [
+  GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildModeration,
+];
 let privileged = true;
 
 const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
@@ -316,6 +396,10 @@ async function start(intents) {
 
   client.on('inviteCreate', (inv) => {
     if (inv.guild) cacheInvites(inv.guild);
+  });
+
+  client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+    if (GUILDS.includes(guild.id)) onAuditEntry(entry, guild, client);
   });
 
   client.on('messageCreate', async (msg) => {
@@ -423,6 +507,25 @@ async function start(intents) {
         const lines = board.map(([id, n], x) => `${medals[x] || `**${x + 1}.**`} <@${id}> — **${n}** invite${n === 1 ? '' : 's'}`);
         await i.reply({ content: `📨 **Invite Leaderboard**\n${lines.join('\n')}`, allowedMentions: { parse: [] } });
 
+      } else if (cmd === 'antinuke') {
+        const me = await i.guild.members.fetchMe();
+        const myPos = me.roles.highest.position;
+        const above = i.guild.roles.cache.filter((r) => r.position > myPos && r.id !== i.guild.id && !r.managed);
+        const rules = Object.values(ANTINUKE)
+          .map((r) => `> ${r.max}+ ${r.label} in ${Math.round(r.windowMs / 1000)}s`)
+          .join('\n');
+        const recent = (state.nuke || []).slice(-3).reverse()
+          .map((n) => `> ${n.at.slice(0, 16).replace('T', ' ')} — <@${n.user}>: ${n.count} ${n.action}`)
+          .join('\n');
+        await i.reply({
+          content: `🛡️ **Anti-nuke: ACTIVE**\n\n**Triggers (auto-quarantine):**\n${rules}\n\n` +
+            `**Exempt:** server owner (Discord won't let bots act on them)${NUKE_WHITELIST.length ? `, ${NUKE_WHITELIST.length} whitelisted` : ''}\n` +
+            `**Can protect against:** ${above.size === 0 ? 'everyone below owner ✅' : `⚠️ **not** ${above.map((r) => r.name).join(', ')} — those roles are above mine, move **Gio Bot** higher in Server Settings → Roles`}\n\n` +
+            (recent ? `**Recent incidents:**\n${recent}` : '**Recent incidents:** none 🎉'),
+          allowedMentions: { parse: [] },
+          flags: MessageFlags.Ephemeral,
+        });
+
       } else if (cmd === 'purge') {
         const amount = i.options.getInteger('amount', true);
         const deleted = await i.channel.bulkDelete(amount, true);
@@ -469,6 +572,8 @@ async function registerCommands(client) {
     new SlashCommandBuilder().setName('levels').setDescription('Server XP leaderboard'),
     new SlashCommandBuilder().setName('gio').setDescription("Gio's live TikTok stats"),
     new SlashCommandBuilder().setName('invites').setDescription('Who has invited the most people'),
+    new SlashCommandBuilder().setName('antinuke').setDescription('Anti-nuke protection status (admins only)')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName('purge').setDescription('Delete recent messages (mods only)')
       .addIntegerOption((o) => o.setName('amount').setDescription('How many (1-100)').setRequired(true).setMinValue(1).setMaxValue(100))
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
