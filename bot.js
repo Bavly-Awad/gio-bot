@@ -534,6 +534,32 @@ async function statsTick(client) {
     const guild = await client.guilds.fetch(gid).catch(() => null);
     if (guild) await statsUpdate(guild);
   }
+  hierarchyUpgrades(client).catch((e) => log('hierarchy upgrade error: ' + e.message));
+}
+
+// Queued cosmetic upgrades that need the bot to outrank ADMIN/Owner. They run
+// automatically the moment the owner drags the bot's role up — no follow-up needed.
+async function hierarchyUpgrades(client) {
+  const guild = await client.guilds.fetch(GUILDS[0]);
+  const me = await guild.members.fetchMe();
+  const myPos = me.roles.highest.position;
+  const admin = guild.roles.cache.find((r) => r.name === 'ADMIN');
+  const ownerRole = guild.roles.cache.find((r) => r.name === 'Owner');
+  const gioRole = guild.roles.cache.find((r) => r.name === '👑 GIO');
+
+  if (admin && admin.position < myPos && !state.adminRestyled) {
+    await admin.edit({ color: 0xED4245, hoist: true }, 'admin visibility: crimson');
+    state.adminRestyled = true; dirty = true;
+    log('hierarchy: ADMIN restyled to crimson');
+    const staff = guild.channels.cache.find((c) => c.name.includes('staff-chat'));
+    if (staff) staff.send('🎨 Role hierarchy unlocked — **ADMIN is now crimson** and 👑 GIO is being moved to the top. Anti-nuke now covers rogue admins too.').catch(() => {});
+  }
+  if (gioRole && admin && ownerRole && gioRole.position < myPos - 1
+      && admin.position < myPos && ownerRole.position < myPos && !state.gioOnTop) {
+    await gioRole.setPosition(myPos - 1, { reason: 'GIO above everyone' });
+    state.gioOnTop = true; dirty = true;
+    log('hierarchy: 👑 GIO moved above ADMIN/Owner');
+  }
 }
 
 // ---------- anti-nuke ----------
