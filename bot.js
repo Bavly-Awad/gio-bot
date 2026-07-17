@@ -7,7 +7,7 @@ const http = require('node:http');
 const {
   Client, GatewayIntentBits, ActivityType, REST, Routes,
   SlashCommandBuilder, MessageFlags, PermissionFlagsBits, ChannelType,
-  Events, AuditLogEvent,
+  Events, AuditLogEvent, Partials,
 } = require('discord.js');
 
 const GUILDS = ['1527114619829620736']; // main server only
@@ -439,6 +439,115 @@ async function dashboardTick(client) {
   } catch (e) { log('dashboard error: ' + e.message); }
 }
 
+// ---------- starboard / hall of fame ----------
+const STAR_EMOJI = '🔥';
+const STAR_THRESHOLD = 3;
+
+async function onReaction(reaction, client) {
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.emoji.name !== STAR_EMOJI) return;
+    const msg = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
+    if (!msg.inGuild() || !GUILDS.includes(msg.guildId)) return;
+    if (!msg.author || msg.author.bot) return;
+    if ((reaction.count || 0) < STAR_THRESHOLD) return;
+    if (msg.channel.name?.includes('hall-of-fame')) return;
+    state.starred = state.starred || {};
+    if (state.starred[msg.id]) return;
+    state.starred[msg.id] = Date.now();
+    dirty = true;
+
+    const guild = msg.guild;
+    let hall = guild.channels.cache.find((c) => c.name.includes('hall-of-fame'));
+    if (!hall) {
+      hall = await guild.channels.create({
+        name: '🏆-hall-of-fame',
+        type: ChannelType.GuildText,
+        position: 2,
+        topic: 'Legendary messages — 3+ 🔥 reactions gets you in here forever.',
+        permissionOverwrites: [{ id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.AddReactions], deny: [PermissionFlagsBits.SendMessages] }],
+        reason: 'starboard',
+      });
+      log('created #🏆-hall-of-fame');
+    }
+    const img = msg.attachments.find((a) => a.contentType?.startsWith('image/'));
+    await hall.send({
+      content: `🔥 **${reaction.count}** • ${msg.channel} • <@${msg.author.id}>\n` +
+        (msg.content ? `>>> ${msg.content.slice(0, 900)}\n` : '') +
+        (img ? `${img.url}\n` : '') +
+        `[jump to message](${msg.url})`,
+      allowedMentions: { parse: [] },
+    });
+    log(`starboard: immortalized ${msg.id} (${reaction.count} 🔥)`);
+  } catch (e) { log('starboard error: ' + e.message); }
+}
+
+// ---------- booster perks ----------
+async function onBoost(before, after) {
+  try {
+    if (!GUILDS.includes(after.guild.id)) return;
+    if (before.premiumSince || !after.premiumSince) return; // only new boosts
+    let role = after.guild.roles.cache.find((r) => r.name === '💖 BOOSTER');
+    if (!role) {
+      role = await after.guild.roles.create({
+        name: '💖 BOOSTER', color: 0xF47FFF, hoist: true, mentionable: false,
+        reason: 'booster perks',
+      });
+      log('created 💖 BOOSTER role');
+    }
+    await after.roles.add(role).catch(() => {});
+    const chat = after.guild.channels.cache.find((c) => c.name.includes('┆chat'));
+    if (chat) await chat.send({
+      content: `💖 **HUGE!** <@${after.id}> just BOOSTED the server! Shiny 💖 BOOSTER role granted — absolute legend. 🚀`,
+      allowedMentions: { users: [after.id] },
+    });
+  } catch (e) { log('booster error: ' + e.message); }
+}
+
+// ---------- weekly invite contest ----------
+// Sundays after noon (Toronto): top 3 inviters since the last reset win 🏆 Legend
+// plus a shoutout in announcements; the baseline then resets for the new week.
+async function inviteContestTick(client) {
+  try {
+    const s = (state.inviteContest = state.inviteContest || {});
+    const gid = GUILDS[0];
+    const totals = state.invites?.[gid] || {};
+    if (!s.baseline) { s.baseline = { ...totals }; dirty = true; return; }
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+    const dow = new Date().toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'short' });
+    const hour = Number(new Date().toLocaleString('en-US', { timeZone: 'America/Toronto', hour: 'numeric', hour12: false }));
+    if (dow !== 'Sun' || hour < 12 || s.lastResolved === today) return;
+
+    const deltas = Object.entries(totals)
+      .map(([id, n]) => [id, n - (s.baseline[id] || 0)])
+      .filter(([, d]) => d > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+    const guild = await client.guilds.fetch(gid);
+    const ann = guild.channels.cache.find((c) => c.name.includes('「📢」announcements'))
+      || guild.channels.cache.find((c) => c.name.includes('announcements'));
+    if (deltas.length && ann) {
+      const legend = guild.roles.cache.find((r) => r.name.includes('Legend'));
+      const medals = ['🥇', '🥈', '🥉'];
+      const lines = [];
+      for (let i = 0; i < deltas.length; i++) {
+        const [id, d] = deltas[i];
+        lines.push(`${medals[i]} <@${id}> — **${d}** invite${d === 1 ? '' : 's'}`);
+        if (legend) await guild.members.fetch(id).then((m) => m.roles.add(legend)).catch(() => {});
+      }
+      await ann.send({
+        content: `# 🏆 INVITE CONTEST — weekly winners!\n${lines.join('\n')}\n\nAll three earn the **🏆 Legend** role. New week starts NOW — bring your friends and check \`/invites\` for live standings. 📨`,
+        allowedMentions: { users: deltas.map(([id]) => id) },
+      });
+      log(`invite contest resolved: ${deltas.length} winner(s)`);
+    }
+    s.baseline = { ...totals };
+    s.lastResolved = today;
+    dirty = true;
+  } catch (e) { log('invite contest error: ' + e.message); }
+}
+
 // ---------- welcome bookkeeping ----------
 // One welcome per member, ever. Backed by state so it survives restarts and the
 // brief old+new instance overlap during Render deploys.
@@ -747,12 +856,14 @@ async function tiktokStats() {
 // ---------- client ----------
 const FULL_INTENTS = [
   GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildMessageReactions, // starboard
   GatewayIntentBits.GuildModeration, // required for audit-log events (anti-nuke)
   GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent,
   GatewayIntentBits.GuildInvites,
 ];
 const BASIC_INTENTS = [
   GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildMessageReactions,
   GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildModeration,
 ];
 let privileged = true;
@@ -760,7 +871,8 @@ let privileged = true;
 const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
 
 async function start(intents) {
-  const client = new Client({ intents });
+  // partials: starboard must see reactions on messages sent before this boot
+  const client = new Client({ intents, partials: [Partials.Message, Partials.Reaction, Partials.Channel] });
 
   client.once('clientReady', async () => {
     log(`online as ${client.user.tag} (privileged intents: ${privileged})`);
@@ -782,7 +894,7 @@ async function start(intents) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
       if (guild) await cacheInvites(guild);
     }
-    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); saveState(); };
+    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); inviteContestTick(client); saveState(); };
     tick(); setInterval(tick, 5 * 60 * 1000);
 
     // Social alerts get their own, faster timer — this is the latency users actually feel.
@@ -803,6 +915,9 @@ async function start(intents) {
   client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
     if (GUILDS.includes(guild.id)) onAuditEntry(entry, guild, client);
   });
+
+  client.on('messageReactionAdd', (reaction) => onReaction(reaction, client));
+  client.on('guildMemberUpdate', (before, after) => onBoost(before, after));
 
   client.on('messageCreate', async (msg) => {
     try {
