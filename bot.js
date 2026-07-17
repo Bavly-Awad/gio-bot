@@ -443,43 +443,76 @@ async function dashboardTick(client) {
 const STAR_EMOJI = '🔥';
 const STAR_THRESHOLD = 3;
 
+// Shared induction: used by both the live reaction event and the periodic sweep.
+async function inductToHall(msg, count) {
+  if (!msg.author || msg.author.bot) return false;
+  if (msg.channel.name?.includes('hall-of-fame')) return false;
+  state.starred = state.starred || {};
+  if (state.starred[msg.id]) return false;
+  state.starred[msg.id] = Date.now();
+  dirty = true;
+
+  const guild = msg.guild;
+  let hall = guild.channels.cache.find((c) => c.name.includes('hall-of-fame'));
+  if (!hall) {
+    hall = await guild.channels.create({
+      name: '🏆-hall-of-fame',
+      type: ChannelType.GuildText,
+      position: 2,
+      topic: 'Legendary messages — 3+ 🔥 reactions gets you in here forever.',
+      permissionOverwrites: [{ id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.AddReactions], deny: [PermissionFlagsBits.SendMessages] }],
+      reason: 'starboard',
+    });
+    log('created #🏆-hall-of-fame');
+  }
+  const img = msg.attachments.find((a) => a.contentType?.startsWith('image/'));
+  await hall.send({
+    content: `🔥 **${count}** • ${msg.channel} • <@${msg.author.id}>\n` +
+      (msg.content ? `>>> ${msg.content.slice(0, 900)}\n` : '') +
+      (img ? `${img.url}\n` : '') +
+      `[jump to message](${msg.url})`,
+    allowedMentions: { parse: [] },
+  });
+  log(`starboard: immortalized ${msg.id} (${count} 🔥)`);
+  return true;
+}
+
 async function onReaction(reaction, client) {
   try {
     if (reaction.partial) await reaction.fetch();
     if (reaction.emoji.name !== STAR_EMOJI) return;
     const msg = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
     if (!msg.inGuild() || !GUILDS.includes(msg.guildId)) return;
-    if (!msg.author || msg.author.bot) return;
     if ((reaction.count || 0) < STAR_THRESHOLD) return;
-    if (msg.channel.name?.includes('hall-of-fame')) return;
-    state.starred = state.starred || {};
-    if (state.starred[msg.id]) return;
-    state.starred[msg.id] = Date.now();
-    dirty = true;
-
-    const guild = msg.guild;
-    let hall = guild.channels.cache.find((c) => c.name.includes('hall-of-fame'));
-    if (!hall) {
-      hall = await guild.channels.create({
-        name: '🏆-hall-of-fame',
-        type: ChannelType.GuildText,
-        position: 2,
-        topic: 'Legendary messages — 3+ 🔥 reactions gets you in here forever.',
-        permissionOverwrites: [{ id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.AddReactions], deny: [PermissionFlagsBits.SendMessages] }],
-        reason: 'starboard',
-      });
-      log('created #🏆-hall-of-fame');
-    }
-    const img = msg.attachments.find((a) => a.contentType?.startsWith('image/'));
-    await hall.send({
-      content: `🔥 **${reaction.count}** • ${msg.channel} • <@${msg.author.id}>\n` +
-        (msg.content ? `>>> ${msg.content.slice(0, 900)}\n` : '') +
-        (img ? `${img.url}\n` : '') +
-        `[jump to message](${msg.url})`,
-      allowedMentions: { parse: [] },
-    });
-    log(`starboard: immortalized ${msg.id} (${reaction.count} 🔥)`);
+    await inductToHall(msg, reaction.count);
   } catch (e) { log('starboard error: ' + e.message); }
+}
+
+// Periodic sweep: catches messages that crossed the threshold while the bot was
+// down/deploying, or that had their 🔥 before the starboard existed.
+async function starboardSweep(client) {
+  try {
+    const guild = await client.guilds.fetch(GUILDS[0]);
+    const chs = await guild.channels.fetch();
+    const targets = [...chs.values()].filter((c) =>
+      c && c.type === ChannelType.GuildText &&
+      !c.name.includes('hall-of-fame') && !c.name.includes('staff') &&
+      !c.name.includes('mod-logs') && !c.name.includes('bot-data') &&
+      c.viewable
+    );
+    let inducted = 0;
+    for (const ch of targets) {
+      const msgs = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+      if (!msgs) continue;
+      for (const msg of msgs.values()) {
+        const fire = msg.reactions.cache.get(STAR_EMOJI);
+        if (fire && fire.count >= STAR_THRESHOLD && !state.starred?.[msg.id]) {
+          if (await inductToHall(msg, fire.count)) inducted++;
+        }
+      }
+    }
+    if (inducted) log(`starboard sweep: inducted ${inducted} message(s)`);
+  } catch (e) { log('starboard sweep error: ' + e.message); }
 }
 
 // ---------- booster perks ----------
@@ -926,6 +959,9 @@ async function start(intents) {
 
     // Truly-live dashboard: instant on join/leave, 10-second heartbeat otherwise.
     dashboardTick(client); setInterval(() => dashRefresh(client), 10 * 1000);
+
+    // Starboard sweep: catch 🔥 milestones missed while offline (boot + hourly).
+    starboardSweep(client); setInterval(() => starboardSweep(client), 60 * 60 * 1000);
   });
 
   client.on('inviteCreate', (inv) => {
