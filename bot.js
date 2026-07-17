@@ -388,7 +388,18 @@ async function socialTick(client) {
 // ---------- live stats dashboard ----------
 // The sidebar member-count channel is capped by Discord at 2 renames/10 min, so it
 // lags during join waves. This is the truly-live surface: a single message in
-// #📊-stats edited every 30 seconds (message edits aren't rename-capped).
+// #📊-stats, edited the INSTANT members join/leave (2s coalescing for bursts) plus
+// a 10s heartbeat. Message edits aren't rename-capped (~1/s is allowed).
+let dashLastEdit = 0;
+let dashPending = null;
+function dashRefresh(client) {
+  const since = Date.now() - dashLastEdit;
+  if (since >= 2000) { dashLastEdit = Date.now(); dashboardTick(client); }
+  else if (!dashPending) {
+    dashPending = setTimeout(() => { dashPending = null; dashLastEdit = Date.now(); dashboardTick(client); }, 2000 - since);
+  }
+}
+
 async function dashboardTick(client) {
   try {
     const guild = await client.guilds.fetch(GUILDS[0]);
@@ -744,8 +755,8 @@ async function start(intents) {
     // Member-count channel: 10-minute cadence (Discord caps renames at 2 per 10 min).
     statsTick(client); setInterval(() => statsTick(client), 10 * 60 * 1000);
 
-    // Truly-live dashboard: 30-second message edits in #📊-stats.
-    dashboardTick(client); setInterval(() => dashboardTick(client), 30 * 1000);
+    // Truly-live dashboard: instant on join/leave, 10-second heartbeat otherwise.
+    dashboardTick(client); setInterval(() => dashRefresh(client), 10 * 1000);
   });
 
   client.on('inviteCreate', (inv) => {
@@ -775,10 +786,17 @@ async function start(intents) {
     } catch (e) { log('messageCreate error: ' + e.message); }
   });
 
+  client.on('guildMemberRemove', (member) => {
+    if (!GUILDS.includes(member.guild.id)) return;
+    statsUpdate(member.guild); // sidebar counter (rename-capped)
+    dashRefresh(client);       // dashboard message (instant)
+  });
+
   client.on('guildMemberAdd', async (member) => {
     try {
       if (!GUILDS.includes(member.guild.id)) return;
-      statsUpdate(member.guild); // instant member-count refresh
+      statsUpdate(member.guild); // sidebar counter (rename-capped)
+      dashRefresh(client); // dashboard message (instant)
       const autoRole = member.guild.roles.cache.find((r) => r.name === AUTO_ROLE);
       if (autoRole) await member.roles.add(autoRole).catch((e) => log('autorole error: ' + e.message));
       await attributeJoin(member);
