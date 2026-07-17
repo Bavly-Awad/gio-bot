@@ -32,6 +32,35 @@ if (process.env.RENDER_EXTERNAL_URL) {
 let state = { xp: {}, qotd: {}, growth: { history: {} } };
 let dirty = false;
 let dataChannel = null;
+let lastSavedMsgId = null;
+
+// Instance identity: Render's zero-downtime deploys briefly run old+new processes.
+// The lease inside the state file lets the old instance detect a newer owner and
+// retire itself instead of clobbering the new instance's writes.
+const INSTANCE = Math.random().toString(36).slice(2, 10);
+const BOOT_AT = Date.now();
+
+// Union/max merge so concurrent instances can never erase each other's progress.
+function mergeState(f) {
+  if (!f || typeof f !== 'object') return;
+  for (const g of Object.keys(f.xp || {})) {
+    state.xp[g] = state.xp[g] || {};
+    for (const [u, rec] of Object.entries(f.xp[g])) {
+      const mine = state.xp[g][u];
+      if (!mine || (rec.total || 0) > (mine.total || 0)) state.xp[g][u] = rec;
+    }
+  }
+  state.welcomed = state.welcomed || {};
+  for (const g of Object.keys(f.welcomed || {})) state.welcomed[g] = { ...f.welcomed[g], ...(state.welcomed[g] || {}) };
+  state.starred = { ...(f.starred || {}), ...(state.starred || {}) };
+  state.invites = state.invites || {};
+  for (const g of Object.keys(f.invites || {})) {
+    state.invites[g] = state.invites[g] || {};
+    for (const [u, n] of Object.entries(f.invites[g])) state.invites[g][u] = Math.max(state.invites[g][u] || 0, n);
+  }
+  for (const k of ['socials', 'qotd', 'growth', 'inviteContest', 'nuke', 'dashMsgId', 'adminRestyled', 'gioOnTop'])
+    if (state[k] === undefined && f[k] !== undefined) state[k] = f[k];
+}
 
 async function loadState(client) {
   try {
@@ -54,6 +83,7 @@ async function loadState(client) {
     if (withFile) {
       const url = withFile.attachments.first().url;
       state = { ...state, ...(await (await fetch(url)).json()) };
+      lastSavedMsgId = withFile.id;
       log('state loaded from data channel');
     }
   } catch (e) { log('loadState error: ' + e.message); }
@@ -62,12 +92,47 @@ async function loadState(client) {
 async function saveState() {
   if (!dirty || !dataChannel) return;
   try {
+    // fence + merge: if another instance wrote state since our last save, absorb its
+    // progress — and if it's a NEWER instance, this process is the stale one: retire.
+    const existing = await dataChannel.messages.fetch({ limit: 5 });
+    const latest = existing.find((m) => m.attachments.size > 0);
+    if (latest && latest.id !== lastSavedMsgId) {
+      try {
+        const foreign = await (await fetch(latest.attachments.first().url)).json();
+        if (foreign.lease && foreign.lease.id !== INSTANCE && foreign.lease.at > BOOT_AT) {
+          log('newer instance owns the state — retiring this process');
+          process.exit(0);
+        }
+        mergeState(foreign);
+      } catch {}
+    }
+    state.lease = { id: INSTANCE, at: BOOT_AT };
     const buf = Buffer.from(JSON.stringify(state));
     const newMsg = await dataChannel.send({ files: [{ attachment: buf, name: 'state.json' }] });
+    lastSavedMsgId = newMsg.id;
     const msgs = await dataChannel.messages.fetch({ limit: 20 });
     for (const m of msgs.values()) if (m.id !== newMsg.id && m.author.bot) await m.delete().catch(() => {});
     dirty = false;
   } catch (e) { log('saveState error: ' + e.message); }
+}
+
+// ---------- crash safety + gateway watchdog ----------
+process.on('unhandledRejection', (e) => log('unhandledRejection: ' + (e?.message || e)));
+process.on('uncaughtException', (e) => {
+  log('uncaughtException: ' + (e?.stack || e?.message || e));
+  Promise.resolve(saveState()).finally(() => process.exit(1)); // Render restarts us clean
+});
+process.on('SIGINT', () => { Promise.resolve(saveState()).finally(() => process.exit(0)); });
+
+function armWatchdog(client) {
+  let lastHealthy = Date.now();
+  setInterval(() => {
+    if (client.ws.status === 0) { lastHealthy = Date.now(); return; } // 0 = Ready
+    if (Date.now() - lastHealthy > 5 * 60 * 1000) {
+      log('gateway unhealthy for 5+ minutes — forcing restart');
+      Promise.resolve(saveState()).finally(() => process.exit(1));
+    }
+  }, 30 * 1000);
 }
 
 // ---------- XP / leveling ----------
@@ -233,6 +298,7 @@ async function checkTikTok(client) {
   const info = await grabJson(`https://www.tikwm.com/api/user/info?unique_id=${SOCIAL.tiktok}`);
   const count = info?.data?.stats?.videoCount;
   const haveCount = typeof count === 'number';
+  noteSource(client, 'tiktok', haveCount);
   if (haveCount && s.tiktokCount == null) { s.tiktokCount = count; dirty = true; }
   if (haveCount && count <= s.tiktokCount) {
     if (count < s.tiktokCount) { s.tiktokCount = count; dirty = true; }
@@ -324,12 +390,12 @@ async function checkTwitch(client) {
   } catch {}
   if (live === null) {
     const t = await grab(`https://decapi.me/twitch/uptime/${SOCIAL.twitch}`);
-    if (t === null) return;
-    const v = t.trim();
+    const v = (t || '').trim();
     if (/^\d+\s+(second|minute|hour|day)/i.test(v)) live = true;
     else if (/is offline/i.test(v)) live = false;
-    else return; // unknown — never guess a live ping
+    else { noteSource(client, 'twitch', false); return; } // unknown — never guess a live ping
   }
+  noteSource(client, 'twitch', true);
   if (live && !s.twitchLive) {
     const ok = await announce(client, SOCIAL.ch.live,
       `<@&${SOCIAL.role.live}> 🔴 **GIO IS LIVE ON TWITCH!** Get in here 👇\nhttps://twitch.tv/${SOCIAL.twitch}`,
@@ -352,7 +418,8 @@ async function checkTwitch(client) {
 async function checkYouTube(client) {
   const s = state.socials;
   const xml = await grab(`https://www.youtube.com/feeds/videos.xml?channel_id=${SOCIAL.youtubeChannelId}`);
-  if (!xml || !xml.includes('<feed')) return;
+  if (!xml || !xml.includes('<feed')) { noteSource(client, 'youtube', false); return; }
+  noteSource(client, 'youtube', true);
   const entries = [...xml.matchAll(/<entry>[\s\S]*?<yt:videoId>(.*?)<\/yt:videoId>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/entry>/g)];
   if (!entries.length) return;
   const newest = entries[0][1];
@@ -368,6 +435,33 @@ async function checkYouTube(client) {
     if (!ok) return;
     log(`youtube: posted ${id}`);
     s.youtubeLast = id; dirty = true;
+  }
+}
+
+// A data source that dies quietly = missed alerts nobody notices. Track consecutive
+// failures per source; warn staff once after ~1h dark, confirm recovery.
+async function noteSource(client, name, ok) {
+  const s = state.socials;
+  s.health = s.health || {};
+  const h = (s.health[name] = s.health[name] || { fails: 0, alerted: false });
+  if (ok) {
+    if (h.alerted) {
+      const guild = await client.guilds.fetch(GUILDS[0]).catch(() => null);
+      const staff = guild?.channels.cache.find((c) => c.name.includes('staff-chat'));
+      if (staff) staff.send(`✅ **${name}** source recovered after ${h.fails} failed checks — alerts back to normal.`).catch(() => {});
+      log(`source recovered: ${name}`);
+    }
+    s.health[name] = { fails: 0, alerted: false };
+    dirty = true;
+    return;
+  }
+  h.fails++; dirty = true;
+  if (h.fails >= 20 && !h.alerted) {
+    h.alerted = true;
+    const guild = await client.guilds.fetch(GUILDS[0]).catch(() => null);
+    const staff = guild?.channels.cache.find((c) => c.name.includes('staff-chat'));
+    if (staff) staff.send(`⚠️ **Notifier warning:** the **${name}** source has failed ${h.fails} checks (~1h). Alerts may be delayed — it keeps retrying automatically, nothing is lost.`).catch(() => {});
+    log(`source dark: ${name} (${h.fails} fails)`);
   }
 }
 
@@ -962,6 +1056,9 @@ async function start(intents) {
 
     // Starboard sweep: catch 🔥 milestones missed while offline (boot + hourly).
     starboardSweep(client); setInterval(() => starboardSweep(client), 60 * 60 * 1000);
+
+    // Gateway watchdog: if the connection dies for 5+ minutes, restart clean.
+    armWatchdog(client);
   });
 
   client.on('inviteCreate', (inv) => {
