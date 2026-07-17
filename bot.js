@@ -504,6 +504,25 @@ async function onBoost(before, after) {
   } catch (e) { log('booster error: ' + e.message); }
 }
 
+// Boot sweep: anyone boosting while the bot was down/deploying still gets the role
+// (silently — the hype message is only for live boost events).
+async function boosterCatchUp(client) {
+  try {
+    const guild = await client.guilds.fetch(GUILDS[0]);
+    const members = await guild.members.fetch();
+    const boosters = members.filter((m) => m.premiumSince);
+    if (!boosters.size) return;
+    let role = guild.roles.cache.find((r) => r.name === '💖 BOOSTER');
+    if (!role) role = await guild.roles.create({ name: '💖 BOOSTER', color: 0xF47FFF, hoist: true, mentionable: false, reason: 'booster perks' });
+    for (const m of boosters.values()) {
+      if (!m.roles.cache.has(role.id)) {
+        await m.roles.add(role).catch(() => {});
+        log(`booster catch-up: role -> ${m.user.username}`);
+      }
+    }
+  } catch (e) { log('booster catch-up error: ' + e.message); }
+}
+
 // ---------- weekly invite contest ----------
 // Sundays after noon (Toronto): top 3 inviters since the last reset win 🏆 Legend
 // plus a shoutout in announcements; the baseline then resets for the new week.
@@ -890,6 +909,7 @@ async function start(intents) {
     }
     await registerCommands(client);
     await welcomeCatchUp(client);
+    await boosterCatchUp(client);
     for (const gid of GUILDS) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
       if (guild) await cacheInvites(guild);
