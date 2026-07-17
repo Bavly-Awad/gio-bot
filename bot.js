@@ -368,6 +368,26 @@ async function socialTick(client) {
   r.forEach((x, i) => { if (x.status === 'rejected') log(`social check ${['tiktok', 'twitch', 'youtube'][i]} failed: ${x.reason}`); });
 }
 
+// ---------- live member-count channel ----------
+// Discord hard-limits channel renames to 2 per 10 minutes, so this runs on its own
+// 10-minute cadence and only renames when the count actually changed.
+async function statsTick(client) {
+  for (const gid of GUILDS) {
+    try {
+      const guild = await client.guilds.fetch(gid);
+      const chs = await guild.channels.fetch();
+      const ch = chs.find((c) => c && c.name.startsWith('👥 Members:'));
+      if (!ch) continue;
+      const count = guild.memberCount;
+      const want = `👥 Members: ${count}`;
+      if (ch.name !== want) {
+        await ch.setName(want, 'live member count');
+        log(`stats: member count -> ${count}`);
+      }
+    } catch (e) { log('stats error: ' + e.message); }
+  }
+}
+
 // ---------- anti-nuke ----------
 // Catches a compromised admin / rogue mod destroying the server: mass channel or
 // role deletion, mass bans/kicks, webhook spam. AutoMod covers spam, not destruction.
@@ -586,6 +606,9 @@ async function start(intents) {
     // Social alerts get their own, faster timer — this is the latency users actually feel.
     const social = () => socialTick(client).then(saveState);
     social(); setInterval(social, 3 * 60 * 1000);
+
+    // Member-count channel: 10-minute cadence (Discord caps renames at 2 per 10 min).
+    statsTick(client); setInterval(() => statsTick(client), 10 * 60 * 1000);
   });
 
   client.on('inviteCreate', (inv) => {
