@@ -355,7 +355,15 @@ async function checkYouTube(client) {
 }
 
 async function socialTick(client) {
-  state.socials = state.socials || {};
+  // First-boot seed = where the retired GitHub notifier left off, so the handover
+  // neither re-announces old posts nor drops the one pending upload (count 174 -> 175).
+  state.socials = state.socials || {
+    tiktokLast: '7663232041340636437',
+    tiktokCount: 174,
+    tiktokWaitSince: null,
+    youtubeLast: 'y_x-MsvyS3Q',
+    twitchLive: false,
+  };
   const r = await Promise.allSettled([checkTikTok(client), checkTwitch(client), checkYouTube(client)]);
   r.forEach((x, i) => { if (x.status === 'rejected') log(`social check ${['tiktok', 'twitch', 'youtube'][i]} failed: ${x.reason}`); });
 }
