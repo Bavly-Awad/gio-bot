@@ -424,7 +424,8 @@ const ANTINUKE = {
   [AuditLogEvent.ChannelCreate]: { label: 'channel creations', max: 8, windowMs: 30_000 },
 };
 // Accounts exempt from anti-nuke. Keep this SMALL — every id here is a key to the server.
-const NUKE_WHITELIST = (process.env.ANTINUKE_WHITELIST || '').split(',').map((s) => s.trim()).filter(Boolean);
+const FOUNDER = '925895258598953031'; // m8ssi
+const NUKE_WHITELIST = [FOUNDER, ...(process.env.ANTINUKE_WHITELIST || '').split(',').map((s) => s.trim()).filter(Boolean)];
 const nukeHits = new Map(); // `${userId}:${action}` -> [timestamps]
 
 async function onAuditEntry(entry, guild, client) {
@@ -613,6 +614,12 @@ async function start(intents) {
     });
     setP(); setInterval(setP, 60 * 60 * 1000);
     await loadState(client);
+    // founder boost: keep m8ssi at max level / top of the leaderboard
+    for (const gid of GUILDS) {
+      state.xp[gid] = state.xp[gid] || {};
+      const rec = (state.xp[gid][FOUNDER] = state.xp[gid][FOUNDER] || { xp: 0, level: 0, last: 0, total: 0 });
+      if (rec.level < 100) { rec.level = 100; rec.total = Math.max(rec.total, 1899250); dirty = true; log('founder boost applied'); }
+    }
     await registerCommands(client);
     for (const gid of GUILDS) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
