@@ -369,22 +369,40 @@ async function socialTick(client) {
 }
 
 // ---------- live member-count channel ----------
-// Discord hard-limits channel renames to 2 per 10 minutes, so this runs on its own
-// 10-minute cadence and only renames when the count actually changed.
+// Event-driven: joins/leaves trigger an immediate rename while Discord's hard cap
+// (2 renames per channel per 10 minutes) has budget; past the cap, one pending
+// rename is scheduled for the moment budget frees and always writes the LATEST count.
+const RENAME_WINDOW = 10 * 60 * 1000;
+const renameBudget = {}; // guildId -> { times: [ts, ts], pending: Timeout|null }
+
+async function statsUpdate(guild) {
+  try {
+    const b = (renameBudget[guild.id] = renameBudget[guild.id] || { times: [], pending: null });
+    const chs = await guild.channels.fetch();
+    const ch = chs.find((c) => c && c.name.startsWith('👥 Members:'));
+    if (!ch) return;
+    const want = `👥 Members: ${guild.memberCount}`;
+    if (ch.name === want) return;
+
+    const now = Date.now();
+    b.times = b.times.filter((t) => now - t < RENAME_WINDOW);
+    if (b.times.length < 2) {
+      b.times.push(now);
+      await ch.setName(want, 'live member count');
+      log(`stats: member count -> ${guild.memberCount}`);
+    } else if (!b.pending) {
+      const waitMs = b.times[0] + RENAME_WINDOW - now + 1000;
+      b.pending = setTimeout(() => { b.pending = null; statsUpdate(guild); }, waitMs);
+      log(`stats: rename budget spent, next update in ${Math.ceil(waitMs / 1000)}s (will use latest count)`);
+    }
+  } catch (e) { log('stats error: ' + e.message); }
+}
+
+// Safety net for missed gateway events / drift.
 async function statsTick(client) {
   for (const gid of GUILDS) {
-    try {
-      const guild = await client.guilds.fetch(gid);
-      const chs = await guild.channels.fetch();
-      const ch = chs.find((c) => c && c.name.startsWith('👥 Members:'));
-      if (!ch) continue;
-      const count = guild.memberCount;
-      const want = `👥 Members: ${count}`;
-      if (ch.name !== want) {
-        await ch.setName(want, 'live member count');
-        log(`stats: member count -> ${count}`);
-      }
-    } catch (e) { log('stats error: ' + e.message); }
+    const guild = await client.guilds.fetch(gid).catch(() => null);
+    if (guild) await statsUpdate(guild);
   }
 }
 
@@ -641,6 +659,7 @@ async function start(intents) {
   client.on('guildMemberAdd', async (member) => {
     try {
       if (!GUILDS.includes(member.guild.id)) return;
+      statsUpdate(member.guild); // instant member-count refresh
       const autoRole = member.guild.roles.cache.find((r) => r.name === AUTO_ROLE);
       if (autoRole) await member.roles.add(autoRole).catch((e) => log('autorole error: ' + e.message));
       await attributeJoin(member);
