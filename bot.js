@@ -178,6 +178,188 @@ async function growthTick(client) {
   } catch (e) { log('growth error: ' + e.message); }
 }
 
+// ---------- social alerts ----------
+// Lives in the bot, not GitHub Actions: Actions throttles */5 crons to roughly hourly
+// on free repos, which made "he posted!" alerts up to an hour late. The bot is already
+// online 24/7, so a plain interval here is both more reliable and more accurate.
+const SOCIAL = {
+  tiktok: 'lightskin.gio',
+  twitch: 'thelightskingio',
+  youtubeChannelId: 'UCzbtrAs2ckrEqhftiiyhVsg',
+  ch: { tiktok: '1527114620974792752', youtube: '1527114620974792753', live: '1527114621247291504' },
+  role: { video: '1527114619829620741', live: '1527114619829620739' },
+};
+const SOCIAL_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36' };
+// How long to hold out for the exact video link before announcing with a profile link.
+// Time-based, not run-based, so it can't drift with polling frequency.
+const FEED_LAG_MS = 20 * 60 * 1000;
+
+async function grab(url, tries = 2) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { headers: SOCIAL_UA, signal: AbortSignal.timeout(20000) });
+      if (r.ok) return await r.text();
+    } catch {}
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, 2000));
+  }
+  return null;
+}
+const grabJson = async (url, tries = 2) => { const t = await grab(url, tries); try { return t && JSON.parse(t); } catch { return null; } };
+
+// Post to a channel. Returns true only if Discord accepted it — callers must not
+// advance state on false, or the alert is lost forever.
+async function announce(client, channelId, content, roleId) {
+  try {
+    const ch = await client.channels.fetch(channelId);
+    await ch.send({ content, allowedMentions: { roles: [roleId], users: [], parse: [] } });
+    return true;
+  } catch (e) { log(`announce failed (${channelId}): ${e.message}`); return false; }
+}
+
+async function tiktokFeed() {
+  const feed = await grabJson(`https://rss-bridge.org/bridge01/?action=display&bridge=TikTokBridge&context=By+user&username=${SOCIAL.tiktok}&format=Json`);
+  const items = feed?.items;
+  if (Array.isArray(items) && items.length) {
+    const list = items.map((it) => ({ id: it.url?.match(/\/video\/(\d+)/)?.[1], url: it.url, title: (it.title || '').trim() })).filter((v) => v.id);
+    if (list.length) return list;
+  }
+  const posts = await grabJson(`https://www.tikwm.com/api/user/posts?unique_id=${SOCIAL.tiktok}&count=10`, 1);
+  const vids = posts?.data?.videos;
+  if (Array.isArray(vids) && vids.length) {
+    return vids.map((v) => ({ id: v.video_id, url: `https://www.tiktok.com/@${SOCIAL.tiktok}/video/${v.video_id}`, title: (v.title || '').trim() }));
+  }
+  return null;
+}
+
+async function checkTikTok(client) {
+  const s = state.socials;
+  const info = await grabJson(`https://www.tikwm.com/api/user/info?unique_id=${SOCIAL.tiktok}`);
+  const count = info?.data?.stats?.videoCount;
+  const haveCount = typeof count === 'number';
+  if (haveCount && s.tiktokCount == null) { s.tiktokCount = count; dirty = true; }
+  if (haveCount && count <= s.tiktokCount) {
+    if (count < s.tiktokCount) { s.tiktokCount = count; dirty = true; }
+    return;
+  }
+
+  const list = await tiktokFeed();
+  const ping = `<@&${SOCIAL.role.video}>`;
+
+  const profileFallback = async () => {
+    const n = haveCount ? count - s.tiktokCount : 1;
+    const ok = await announce(client, SOCIAL.ch.tiktok,
+      `${ping} 🎵 **Gio just dropped ${n > 1 ? `${n} new TikToks` : 'a new TikTok'}!**\nhttps://www.tiktok.com/@${SOCIAL.tiktok}`,
+      SOCIAL.role.video);
+    if (ok) { if (haveCount) s.tiktokCount = count; s.tiktokWaitSince = null; dirty = true; log('tiktok: announced (profile link)'); }
+  };
+
+  if (!list) {
+    if (haveCount && count > s.tiktokCount) {
+      s.tiktokWaitSince = s.tiktokWaitSince || Date.now();
+      if (Date.now() - s.tiktokWaitSince > FEED_LAG_MS) await profileFallback();
+      dirty = true;
+    }
+    return;
+  }
+
+  const idx = s.tiktokLast ? list.findIndex((v) => v.id === s.tiktokLast) : -1;
+  if (!s.tiktokLast) { s.tiktokLast = list[0].id; if (haveCount) s.tiktokCount = count; dirty = true; return; }
+
+  if (idx === 0) {
+    // Feed hasn't caught up yet. Never advance tiktokCount here: doing so would
+    // suppress the alert forever once the feed refreshes.
+    if (haveCount && count > s.tiktokCount) {
+      s.tiktokWaitSince = s.tiktokWaitSince || Date.now();
+      dirty = true;
+      const waited = Math.round((Date.now() - s.tiktokWaitSince) / 60000);
+      if (Date.now() - s.tiktokWaitSince > FEED_LAG_MS) { log(`tiktok: feed stale ${waited}m — falling back to profile link`); await profileFallback(); }
+      else log(`tiktok: videoCount=${count} but feed stale (${waited}m) — holding for exact link`);
+    }
+    return;
+  }
+
+  const fresh = (idx === -1 ? [list[0]] : list.slice(0, idx)).reverse();
+  for (const v of fresh) {
+    const ok = await announce(client, SOCIAL.ch.tiktok,
+      `${ping} 🎵 **Gio just dropped a new TikTok!**\n${v.title ? `> ${v.title}\n` : ''}${v.url}`,
+      SOCIAL.role.video);
+    if (!ok) return; // retry next tick, state untouched
+    log(`tiktok: posted ${v.id}`);
+    s.tiktokLast = v.id;
+    dirty = true;
+  }
+  s.tiktokWaitSince = null;
+  if (haveCount) s.tiktokCount = count;
+  dirty = true;
+}
+
+async function checkTwitch(client) {
+  const s = state.socials;
+  let live = null;
+  try {
+    const r = await fetch('https://gql.twitch.tv/gql', {
+      method: 'POST',
+      headers: { 'Client-ID': 'kimne78kx3ncx6brgo4mv6wki5h1ko', 'Content-Type': 'application/json', ...SOCIAL_UA },
+      body: JSON.stringify([{ operationName: 'UseLive', variables: { channelLogin: SOCIAL.twitch }, extensions: { persistedQuery: { version: 1, sha256Hash: '639d5f11bfb8bf3053b424d9ef650d04c4ebb7d94711d644afb08fe9a0fad5d9' } } }]),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (r.ok) { const d = (await r.json())?.[0]?.data; if (d && 'user' in d) live = d.user === null ? null : !!d.user.stream; }
+  } catch {}
+  if (live === null) {
+    const t = await grab(`https://decapi.me/twitch/uptime/${SOCIAL.twitch}`);
+    if (t === null) return;
+    const v = t.trim();
+    if (/^\d+\s+(second|minute|hour|day)/i.test(v)) live = true;
+    else if (/is offline/i.test(v)) live = false;
+    else return; // unknown — never guess a live ping
+  }
+  if (live && !s.twitchLive) {
+    const ok = await announce(client, SOCIAL.ch.live,
+      `<@&${SOCIAL.role.live}> 🔴 **GIO IS LIVE ON TWITCH!** Get in here 👇\nhttps://twitch.tv/${SOCIAL.twitch}`,
+      SOCIAL.role.live);
+    if (!ok) return;
+    log('twitch: went live, posted');
+    s.twitchLive = true; dirty = true;
+    const guild = await client.guilds.fetch(GUILDS[0]).catch(() => null);
+    if (guild) await guild.scheduledEvents.create({
+      name: '🔴 Gio is LIVE on Twitch',
+      scheduledStartTime: new Date(Date.now() + 2 * 60 * 1000),
+      scheduledEndTime: new Date(Date.now() + 4 * 60 * 60 * 1000),
+      privacyLevel: 2, entityType: 3,
+      entityMetadata: { location: `https://twitch.tv/${SOCIAL.twitch}` },
+      description: 'Stream is up — pull up!',
+    }).catch(() => {});
+  } else if (!live && s.twitchLive) { s.twitchLive = false; dirty = true; log('twitch: stream ended'); }
+}
+
+async function checkYouTube(client) {
+  const s = state.socials;
+  const xml = await grab(`https://www.youtube.com/feeds/videos.xml?channel_id=${SOCIAL.youtubeChannelId}`);
+  if (!xml || !xml.includes('<feed')) return;
+  const entries = [...xml.matchAll(/<entry>[\s\S]*?<yt:videoId>(.*?)<\/yt:videoId>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/entry>/g)];
+  if (!entries.length) return;
+  const newest = entries[0][1];
+  if (!s.youtubeLast) { s.youtubeLast = newest; dirty = true; return; }
+  if (newest === s.youtubeLast) return;
+  const idx = entries.findIndex(([, id]) => id === s.youtubeLast);
+  const fresh = (idx === -1 ? [entries[0]] : entries.slice(0, idx)).reverse();
+  const dec = (t) => t.replace(/&#(\d+);/g, (_, d) => String.fromCharCode(+d)).replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  for (const [, id, raw] of fresh) {
+    const ok = await announce(client, SOCIAL.ch.youtube,
+      `<@&${SOCIAL.role.video}> ▶️ **New Gio video on YouTube!**\n> ${dec(raw).trim()}\nhttps://youtu.be/${id}`,
+      SOCIAL.role.video);
+    if (!ok) return;
+    log(`youtube: posted ${id}`);
+    s.youtubeLast = id; dirty = true;
+  }
+}
+
+async function socialTick(client) {
+  state.socials = state.socials || {};
+  const r = await Promise.allSettled([checkTikTok(client), checkTwitch(client), checkYouTube(client)]);
+  r.forEach((x, i) => { if (x.status === 'rejected') log(`social check ${['tiktok', 'twitch', 'youtube'][i]} failed: ${x.reason}`); });
+}
+
 // ---------- anti-nuke ----------
 // Catches a compromised admin / rogue mod destroying the server: mass channel or
 // role deletion, mass bans/kicks, webhook spam. AutoMod covers spam, not destruction.
@@ -392,6 +574,10 @@ async function start(intents) {
     }
     const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); saveState(); };
     tick(); setInterval(tick, 5 * 60 * 1000);
+
+    // Social alerts get their own, faster timer — this is the latency users actually feel.
+    const social = () => socialTick(client).then(saveState);
+    social(); setInterval(social, 3 * 60 * 1000);
   });
 
   client.on('inviteCreate', (inv) => {
