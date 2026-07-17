@@ -247,10 +247,18 @@ async function checkTikTok(client) {
 
   const profileFallback = async () => {
     const n = haveCount ? count - s.tiktokCount : 1;
-    const ok = await announce(client, SOCIAL.ch.tiktok,
-      `${ping} 🎵 **Gio just dropped ${n > 1 ? `${n} new TikToks` : 'a new TikTok'}!**\nhttps://www.tiktok.com/@${SOCIAL.tiktok}`,
-      SOCIAL.role.video);
-    if (ok) { if (haveCount) s.tiktokCount = count; s.tiktokWaitSince = null; dirty = true; log('tiktok: announced (profile link)'); }
+    try {
+      const ch = await client.channels.fetch(SOCIAL.ch.tiktok);
+      const msg = await ch.send({
+        content: `${ping} 🎵 **Gio just dropped ${n > 1 ? `${n} new TikToks` : 'a new TikTok'}!**\nhttps://www.tiktok.com/@${SOCIAL.tiktok}`,
+        allowedMentions: { roles: [SOCIAL.role.video], users: [], parse: [] },
+      });
+      if (haveCount) s.tiktokCount = count;
+      s.tiktokWaitSince = null;
+      s.fallbackMsgId = msg.id; // upgrade to the exact link in place once the feed catches up
+      dirty = true;
+      log('tiktok: announced (profile link, pending exact-link upgrade)');
+    } catch (e) { log('tiktok: fallback post failed — will retry: ' + e.message); }
   };
 
   if (!list) {
@@ -260,6 +268,13 @@ async function checkTikTok(client) {
       dirty = true;
     }
     return;
+  }
+
+  // one-time migration: the 2026-07-17 03:48 fallback went out before in-place
+  // upgrades existed; adopt it so it still gets the exact link when the feed thaws.
+  if (s.fallbackMsgId === undefined && s.tiktokLast === '7663232041340636437' && s.tiktokCount >= 175) {
+    s.fallbackMsgId = '1527522253393367072';
+    dirty = true;
   }
 
   const idx = s.tiktokLast ? list.findIndex((v) => v.id === s.tiktokLast) : -1;
@@ -280,9 +295,22 @@ async function checkTikTok(client) {
 
   const fresh = (idx === -1 ? [list[0]] : list.slice(0, idx)).reverse();
   for (const v of fresh) {
-    const ok = await announce(client, SOCIAL.ch.tiktok,
-      `${ping} 🎵 **Gio just dropped a new TikTok!**\n${v.title ? `> ${v.title}\n` : ''}${v.url}`,
-      SOCIAL.role.video);
+    const content = `${ping} 🎵 **Gio just dropped a new TikTok!**\n${v.title ? `> ${v.title}\n` : ''}${v.url}`;
+    // If a profile-link fallback went out for this upload, upgrade that post in
+    // place instead of announcing the same video twice.
+    if (s.fallbackMsgId) {
+      try {
+        const ch = await client.channels.fetch(SOCIAL.ch.tiktok);
+        const old = await ch.messages.fetch(s.fallbackMsgId);
+        await old.edit({ content, allowedMentions: { roles: [], users: [], parse: [] } });
+        log(`tiktok: upgraded fallback post to exact link ${v.id}`);
+        s.fallbackMsgId = null;
+        s.tiktokLast = v.id;
+        dirty = true;
+        continue;
+      } catch { s.fallbackMsgId = null; } // message gone — post normally
+    }
+    const ok = await announce(client, SOCIAL.ch.tiktok, content, SOCIAL.role.video);
     if (!ok) return; // retry next tick, state untouched
     log(`tiktok: posted ${v.id}`);
     s.tiktokLast = v.id;
