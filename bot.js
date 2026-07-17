@@ -396,6 +396,54 @@ async function socialTick(client) {
   r.forEach((x, i) => { if (x.status === 'rejected') log(`social check ${['tiktok', 'twitch', 'youtube'][i]} failed: ${x.reason}`); });
 }
 
+// ---------- welcome bookkeeping ----------
+// One welcome per member, ever. Backed by state so it survives restarts and the
+// brief old+new instance overlap during Render deploys.
+function claimWelcome(guildId, userId) {
+  state.welcomed = state.welcomed || {};
+  const w = (state.welcomed[guildId] = state.welcomed[guildId] || {});
+  if (w[userId]) return false;
+  w[userId] = Date.now();
+  dirty = true;
+  return true;
+}
+
+// On boot: seed the ledger from channel history (covers everyone welcomed before
+// the ledger existed), then greet anyone who joined while the bot was deploying.
+async function welcomeCatchUp(client) {
+  for (const gid of GUILDS) {
+    try {
+      const guild = await client.guilds.fetch(gid);
+      const ch = (await guild.channels.fetch()).find((c) => c && c.name === '👋-welcome');
+      if (!ch) continue;
+
+      state.welcomed = state.welcomed || {};
+      const w = (state.welcomed[gid] = state.welcomed[gid] || {});
+      const msgs = await ch.messages.fetch({ limit: 100 });
+      for (const m of msgs.values()) {
+        if (m.author.id !== client.user.id) continue;
+        for (const [, id] of m.content.matchAll(/<@!?(\d+)>/g)) if (!w[id]) { w[id] = m.createdTimestamp; dirty = true; }
+      }
+
+      const members = await guild.members.fetch();
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const missed = [...members.values()].filter((m) =>
+        !m.user.bot && m.joinedTimestamp > dayAgo && !w[m.id]
+      );
+      if (!missed.length) continue;
+      for (const m of missed) { w[m.id] = Date.now(); }
+      dirty = true;
+      // one combined message, not a spam burst
+      const mentions = missed.slice(0, 30).map((m) => `<@${m.id}>`).join(' ');
+      await ch.send({
+        content: `👑 Yo ${mentions} — welcome to **${guild.name}**! Grab your ping roles in **Channels & Roles** and say what's up in chat. 🤝`,
+        allowedMentions: { users: missed.slice(0, 30).map((m) => m.id) },
+      });
+      log(`welcome catch-up: greeted ${missed.length} member(s) missed during downtime`);
+    } catch (e) { log('welcome catch-up error: ' + e.message); }
+  }
+}
+
 // ---------- live member-count channel ----------
 // Event-driven: joins/leaves trigger an immediate rename while Discord's hard cap
 // (2 renames per channel per 10 minutes) has budget; past the cap, one pending
@@ -649,6 +697,7 @@ async function start(intents) {
       if (rec.level < 100) { rec.level = 100; rec.total = Math.max(rec.total, 1899250); dirty = true; log('founder boost applied'); }
     }
     await registerCommands(client);
+    await welcomeCatchUp(client);
     for (const gid of GUILDS) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
       if (guild) await cacheInvites(guild);
@@ -698,6 +747,9 @@ async function start(intents) {
       const autoRole = member.guild.roles.cache.find((r) => r.name === AUTO_ROLE);
       if (autoRole) await member.roles.add(autoRole).catch((e) => log('autorole error: ' + e.message));
       await attributeJoin(member);
+      // dedupe: Render's zero-downtime deploys briefly run two bot instances, and
+      // both receive this event — only the first one to claim the id may welcome.
+      if (member.user.bot || !claimWelcome(member.guild.id, member.id)) return;
       const ch = member.guild.channels.cache.find((c) => c.name === '👋-welcome');
       if (ch) await ch.send({
         content: `👑 Yo <@${member.id}>, welcome to **${member.guild.name}**! Grab your ping roles in **Channels & Roles** and say what's up in chat. 🤝`,
