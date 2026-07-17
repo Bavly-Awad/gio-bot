@@ -385,6 +385,49 @@ async function socialTick(client) {
   r.forEach((x, i) => { if (x.status === 'rejected') log(`social check ${['tiktok', 'twitch', 'youtube'][i]} failed: ${x.reason}`); });
 }
 
+// ---------- live stats dashboard ----------
+// The sidebar member-count channel is capped by Discord at 2 renames/10 min, so it
+// lags during join waves. This is the truly-live surface: a single message in
+// #📊-stats edited every 30 seconds (message edits aren't rename-capped).
+async function dashboardTick(client) {
+  try {
+    const guild = await client.guilds.fetch(GUILDS[0]);
+    const chs = await guild.channels.fetch();
+    let ch = chs.find((c) => c && c.name === '📊-stats');
+    if (!ch) {
+      ch = await guild.channels.create({
+        name: '📊-stats',
+        type: ChannelType.GuildText,
+        position: 1,
+        topic: 'Live server stats — updates every 30 seconds.',
+        permissionOverwrites: [{ id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.SendMessages] }],
+        reason: 'live stats dashboard',
+      });
+      log('created #📊-stats');
+    }
+    const members = guild.members.cache;
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const joinedToday = members.filter((m) => m.joinedTimestamp > dayAgo).size;
+    const online = guild.approximatePresenceCount ?? members.filter((m) => m.presence && m.presence.status !== 'offline').size;
+    const content =
+      `# 📊 LIVE SERVER STATS\n` +
+      `👥 Members: **${guild.memberCount}**\n` +
+      `📈 Joined in the last 24h: **+${joinedToday}**\n` +
+      `🚀 Boosts: **${guild.premiumSubscriptionCount || 0}**\n\n` +
+      `-# Updated <t:${Math.floor(Date.now() / 1000)}:R> — refreshes every 30s`;
+    if (state.dashMsgId) {
+      try {
+        const msg = await ch.messages.fetch(state.dashMsgId);
+        await msg.edit({ content });
+        return;
+      } catch { state.dashMsgId = null; }
+    }
+    const msg = await ch.send({ content });
+    state.dashMsgId = msg.id;
+    dirty = true;
+  } catch (e) { log('dashboard error: ' + e.message); }
+}
+
 // ---------- welcome bookkeeping ----------
 // One welcome per member, ever. Backed by state so it survives restarts and the
 // brief old+new instance overlap during Render deploys.
@@ -700,6 +743,9 @@ async function start(intents) {
 
     // Member-count channel: 10-minute cadence (Discord caps renames at 2 per 10 min).
     statsTick(client); setInterval(() => statsTick(client), 10 * 60 * 1000);
+
+    // Truly-live dashboard: 30-second message edits in #📊-stats.
+    dashboardTick(client); setInterval(() => dashboardTick(client), 30 * 1000);
   });
 
   client.on('inviteCreate', (inv) => {
