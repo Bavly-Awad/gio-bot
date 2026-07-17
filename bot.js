@@ -425,7 +425,7 @@ async function dashboardTick(client) {
       `👥 Members: **${guild.memberCount}**\n` +
       `📈 Joined in the last 24h: **+${joinedToday}**\n` +
       `🚀 Boosts: **${guild.premiumSubscriptionCount || 0}**\n\n` +
-      `-# Updated <t:${Math.floor(Date.now() / 1000)}:R> — refreshes every 30s`;
+      `-# Updated <t:${Math.floor(Date.now() / 1000)}:R> — live (updates the moment someone joins)`;
     if (state.dashMsgId) {
       try {
         const msg = await ch.messages.fetch(state.dashMsgId);
@@ -498,8 +498,19 @@ async function statsUpdate(guild) {
   try {
     const b = (renameBudget[guild.id] = renameBudget[guild.id] || { times: [], pending: null });
     const chs = await guild.channels.fetch();
-    const ch = chs.find((c) => c && c.name.startsWith('👥 Members:'));
-    if (!ch) return;
+    let ch = chs.find((c) => c && c.name.startsWith('👥 Members:'));
+    if (!ch) {
+      // self-heal: someone deleted the counter channel — rebuild it
+      ch = await guild.channels.create({
+        name: `👥 Members: ${guild.memberCount}`,
+        type: ChannelType.GuildVoice,
+        position: 0,
+        permissionOverwrites: [{ id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.Connect] }],
+        reason: 'member counter (recreated)',
+      });
+      log('stats: counter channel was missing — recreated');
+      return;
+    }
     const want = `👥 Members: ${guild.memberCount}`;
     if (ch.name === want) return;
 
