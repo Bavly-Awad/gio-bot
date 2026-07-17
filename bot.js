@@ -190,9 +190,6 @@ const SOCIAL = {
   role: { video: '1527114619829620741', live: '1527114619829620739' },
 };
 const SOCIAL_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36' };
-// How long to hold out for the exact video link before announcing with a profile link.
-// Time-based, not run-based, so it can't drift with polling frequency.
-const FEED_LAG_MS = 20 * 60 * 1000;
 
 async function grab(url, tries = 2) {
   for (let i = 0; i < tries; i++) {
@@ -245,7 +242,10 @@ async function checkTikTok(client) {
   const list = await tiktokFeed();
   const ping = `<@&${SOCIAL.role.video}>`;
 
-  const profileFallback = async () => {
+  // Announce-first policy: the moment videoCount rises, ping with the profile link
+  // (the new video is the top of his page anyway). When a feed finally serves the
+  // exact URL, the post is edited in place. Fans get speed AND the exact link.
+  const instantAnnounce = async () => {
     const n = haveCount ? count - s.tiktokCount : 1;
     try {
       const ch = await client.channels.fetch(SOCIAL.ch.tiktok);
@@ -254,42 +254,31 @@ async function checkTikTok(client) {
         allowedMentions: { roles: [SOCIAL.role.video], users: [], parse: [] },
       });
       if (haveCount) s.tiktokCount = count;
-      s.tiktokWaitSince = null;
-      s.fallbackMsgId = msg.id; // upgrade to the exact link in place once the feed catches up
+      s.fallbackMsgIds = [...(s.fallbackMsgIds || []), msg.id];
       dirty = true;
-      log('tiktok: announced (profile link, pending exact-link upgrade)');
-    } catch (e) { log('tiktok: fallback post failed — will retry: ' + e.message); }
+      log(`tiktok: instant announce (count ${count}), exact-link upgrade pending`);
+    } catch (e) { log('tiktok: announce failed — will retry: ' + e.message); }
   };
 
-  if (!list) {
-    if (haveCount && count > s.tiktokCount) {
-      s.tiktokWaitSince = s.tiktokWaitSince || Date.now();
-      if (Date.now() - s.tiktokWaitSince > FEED_LAG_MS) await profileFallback();
-      dirty = true;
-    }
-    return;
+  // migration from the wait-based design
+  if (s.fallbackMsgIds === undefined) {
+    s.fallbackMsgIds = s.fallbackMsgId ? [s.fallbackMsgId] : [];
+    delete s.fallbackMsgId;
+    delete s.tiktokWaitSince;
+    dirty = true;
   }
 
-  // one-time migration: the 2026-07-17 03:48 fallback went out before in-place
-  // upgrades existed; adopt it so it still gets the exact link when the feed thaws.
-  if (s.fallbackMsgId === undefined && s.tiktokLast === '7663232041340636437' && s.tiktokCount >= 175) {
-    s.fallbackMsgId = '1527522253393367072';
-    dirty = true;
+  if (!list) {
+    if (haveCount && count > s.tiktokCount) await instantAnnounce();
+    return;
   }
 
   const idx = s.tiktokLast ? list.findIndex((v) => v.id === s.tiktokLast) : -1;
   if (!s.tiktokLast) { s.tiktokLast = list[0].id; if (haveCount) s.tiktokCount = count; dirty = true; return; }
 
   if (idx === 0) {
-    // Feed hasn't caught up yet. Never advance tiktokCount here: doing so would
-    // suppress the alert forever once the feed refreshes.
-    if (haveCount && count > s.tiktokCount) {
-      s.tiktokWaitSince = s.tiktokWaitSince || Date.now();
-      dirty = true;
-      const waited = Math.round((Date.now() - s.tiktokWaitSince) / 60000);
-      if (Date.now() - s.tiktokWaitSince > FEED_LAG_MS) { log(`tiktok: feed stale ${waited}m — falling back to profile link`); await profileFallback(); }
-      else log(`tiktok: videoCount=${count} but feed stale (${waited}m) — holding for exact link`);
-    }
+    // Feed is lagging behind the count — announce NOW, upgrade later.
+    if (haveCount && count > s.tiktokCount) await instantAnnounce();
     return;
   }
 
@@ -298,17 +287,17 @@ async function checkTikTok(client) {
     const content = `${ping} 🎵 **Gio just dropped a new TikTok!**\n${v.title ? `> ${v.title}\n` : ''}${v.url}`;
     // If a profile-link fallback went out for this upload, upgrade that post in
     // place instead of announcing the same video twice.
-    if (s.fallbackMsgId) {
+    if (s.fallbackMsgIds?.length) {
+      const msgId = s.fallbackMsgIds.shift();
+      dirty = true;
       try {
         const ch = await client.channels.fetch(SOCIAL.ch.tiktok);
-        const old = await ch.messages.fetch(s.fallbackMsgId);
+        const old = await ch.messages.fetch(msgId);
         await old.edit({ content, allowedMentions: { roles: [], users: [], parse: [] } });
-        log(`tiktok: upgraded fallback post to exact link ${v.id}`);
-        s.fallbackMsgId = null;
+        log(`tiktok: upgraded announce post to exact link ${v.id}`);
         s.tiktokLast = v.id;
-        dirty = true;
         continue;
-      } catch { s.fallbackMsgId = null; } // message gone — post normally
+      } catch { /* message gone — fall through and post normally */ }
     }
     const ok = await announce(client, SOCIAL.ch.tiktok, content, SOCIAL.role.video);
     if (!ok) return; // retry next tick, state untouched
