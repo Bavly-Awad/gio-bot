@@ -147,7 +147,9 @@ async function grantXp(msg) {
   if (now - rec.last < 60 * 1000) return;
   rec.last = now;
   const gain = 15 + Math.floor(Math.random() * 11);
-  rec.xp += gain; rec.total += gain; dirty = true;
+  rec.xp += gain; rec.total += gain;
+  rec.coins = (rec.coins == null ? 100 : rec.coins) + 3 + Math.floor(Math.random() * 5);
+  dirty = true;
   while (rec.xp >= xpToNext(rec.level)) {
     rec.xp -= xpToNext(rec.level);
     rec.level++;
@@ -374,6 +376,11 @@ async function checkTikTok(client) {
   s.tiktokWaitSince = null;
   if (haveCount) s.tiktokCount = count;
   dirty = true;
+  // open view betting on the newest exact-linked video
+  if (fresh.length) {
+    const newest = fresh[fresh.length - 1];
+    await openBet(client, newest.id, newest.url).catch((e) => log('openBet error: ' + e.message));
+  }
 }
 
 async function checkTwitch(client) {
@@ -692,6 +699,130 @@ async function inviteContestTick(client) {
     s.lastResolved = today;
     dirty = true;
   } catch (e) { log('invite contest error: ' + e.message); }
+}
+
+// ---------- Gio Coins economy ----------
+function coinRec(g, u) {
+  state.xp[g] = state.xp[g] || {};
+  const r = (state.xp[g][u] = state.xp[g][u] || { xp: 0, level: 0, last: 0, total: 0 });
+  if (r.coins == null) r.coins = 100; // starter balance
+  return r;
+}
+const fmtC = (n) => `**${n.toLocaleString()}** 🪙`;
+
+const SLOT_REELS = ['🍒', '🍋', '💎', '🎵', '🔥', '👑'];
+function spinSlots(bet) {
+  const r = () => SLOT_REELS[Math.floor(Math.random() * SLOT_REELS.length)];
+  const s = [r(), r(), r()];
+  let mult = 0;
+  if (s[0] === s[1] && s[1] === s[2]) mult = s[0] === '👑' ? 15 : 8;
+  else if (s[0] === s[1] || s[1] === s[2] || s[0] === s[2]) mult = 2;
+  return { s, win: bet * mult };
+}
+
+const ROASTS = [
+  "you type like your wifi is buffering. 💀",
+  "your /rank is public and yet you're still talking. 📉",
+  "Gio has 175 videos and you're the blooper reel.",
+  "you'd lose a W/L vote against a wall. 🇱",
+  "the QOTD is easier than whatever you're doing rn.",
+  "your best clip got 0 🔥 and honestly? accurate.",
+  "even the AutoMod feels bad blocking you.",
+  "you joined for the pings and stayed to embarrass yourself. 🤝",
+  "level 0 behavior with level 100 confidence.",
+  "you're the reason slowmode exists.",
+  "the Hall of Fame has restraining orders for less.",
+  "somewhere in Toronto, Gio just cringed and doesn't know why.",
+];
+const shipScore = (a, b) => {
+  const key = [a, b].sort().join('');
+  let h = 0;
+  for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  return Math.abs(h) % 101;
+};
+
+// ---------- view-count betting ----------
+const BET_LINE = 100000, BET_OPEN_MS = 6 * 60 * 60 * 1000, BET_RESOLVE_MS = 24 * 60 * 60 * 1000;
+
+async function openBet(client, videoId, url) {
+  if (state.bet && state.bet.status === 'open') return;
+  state.bet = {
+    videoId, url, line: BET_LINE,
+    closesAt: Date.now() + BET_OPEN_MS,
+    resolvesAt: Date.now() + BET_RESOLVE_MS,
+    wagers: {}, status: 'open',
+  };
+  dirty = true;
+  const ch = await client.channels.fetch(SOCIAL.ch.tiktok).catch(() => null);
+  if (ch) await ch.send({
+    content: `📈 **BETTING IS OPEN on this video!**\nWill it hit **${BET_LINE.toLocaleString()} views in 24h**?\n` +
+      `> \`/bet\` **over** or **under** with your 🪙 — win pays **2x**\n` +
+      `> Betting closes <t:${Math.floor(state.bet.closesAt / 1000)}:R> • resolves <t:${Math.floor(state.bet.resolvesAt / 1000)}:R>`,
+    allowedMentions: { parse: [] },
+  });
+  log(`bet opened on ${videoId}`);
+}
+
+async function resolveBetTick(client) {
+  try {
+    const b = state.bet;
+    if (!b || b.status !== 'open' || Date.now() < b.resolvesAt) return;
+    const j = await grabJson(`https://www.tikwm.com/api/?url=${encodeURIComponent(b.url)}`, 2);
+    const views = j?.data?.play_count;
+    const ch = await client.channels.fetch(SOCIAL.ch.tiktok).catch(() => null);
+    if (typeof views !== 'number') {
+      if (Date.now() > b.resolvesAt + 12 * 60 * 60 * 1000) { // give up after 12h of retries: refund
+        for (const [uid, w] of Object.entries(b.wagers)) coinRec(GUILDS[0], uid).coins += w.amt;
+        b.status = 'refunded'; dirty = true;
+        if (ch) await ch.send('📈 Betting refunded — view data was unavailable. Your 🪙 are back.');
+        log('bet refunded (no view data)');
+      }
+      return;
+    }
+    const result = views >= b.line ? 'over' : 'under';
+    const winners = Object.entries(b.wagers).filter(([, w]) => w.side === result);
+    for (const [uid, w] of winners) coinRec(GUILDS[0], uid).coins += w.amt * 2;
+    b.status = 'resolved'; b.views = views; dirty = true;
+    if (ch) await ch.send({
+      content: `📈 **BET RESOLVED:** the video hit **${views.toLocaleString()} views** — **${result.toUpperCase()}** wins! 🎉\n` +
+        (winners.length ? `Paid 2x to: ${winners.map(([uid]) => `<@${uid}>`).join(' ')}` : 'Nobody called it. House keeps the bag. 💰'),
+      allowedMentions: { users: winners.map(([uid]) => uid) },
+    });
+    log(`bet resolved: ${views} views, ${result}, ${winners.length} winners`);
+  } catch (e) { log('bet resolve error: ' + e.message); }
+}
+
+// ---------- secret code vault ----------
+async function checkSecretCode(msg) {
+  const sec = state.secret;
+  if (!sec || !sec.code) return;
+  if ((msg.content || '').toLowerCase().trim() !== sec.code) return;
+  if (sec.claimed.includes(msg.author.id)) return;
+  await msg.delete().catch(() => {}); // keep the code off the screen
+  const guild = msg.guild;
+  let role = guild.roles.cache.find((r) => r.name === '🗝️ CODEBREAKER');
+  if (!role) role = await guild.roles.create({ name: '🗝️ CODEBREAKER', color: 0x9B59B6, hoist: false, mentionable: false, reason: 'secret code vault' });
+  let vault = guild.channels.cache.find((c) => c.name.includes('the-vault'));
+  if (!vault) {
+    const community = guild.channels.cache.find((c) => c.type === ChannelType.GuildCategory && c.name.includes('COMMUNITY'));
+    vault = await guild.channels.create({
+      name: '🗝️-the-vault', type: ChannelType.GuildText, parent: community?.id,
+      topic: 'You found the code. Welcome to the vault.',
+      permissionOverwrites: [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: role.id, allow: [PermissionFlagsBits.ViewChannel] },
+      ],
+      reason: 'secret code vault',
+    });
+    await vault.send('# 🗝️ THE VAULT\nOnly codebreakers see this. You caught the code — that makes you certified locked in. 🤫');
+  }
+  await msg.member.roles.add(role).catch(() => {});
+  sec.claimed.push(msg.author.id);
+  coinRec(guild.id, msg.author.id).coins += 500;
+  dirty = true;
+  await msg.author.send(`🗝️ **You cracked the code!** The hidden **${vault.name}** channel just unlocked for you, plus **500 🪙**. Don't spill it. 🤫`).catch(() => {});
+  if (sec.claimed.length >= sec.max) { state.secret = null; log('secret code fully claimed'); }
+  log(`code claimed by ${msg.author.username} (${sec.claimed.length}/${sec.max})`);
 }
 
 // ---------- 3-day meme challenge (one-shot, self-running) ----------
@@ -1100,7 +1231,7 @@ async function start(intents) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
       if (guild) await cacheInvites(guild);
     }
-    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); inviteContestTick(client); memeContestTick(client); saveState(); };
+    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); inviteContestTick(client); memeContestTick(client); resolveBetTick(client); saveState(); };
     tick(); setInterval(tick, 5 * 60 * 1000);
 
     // Social alerts get their own, faster timer — this is the latency users actually feel.
@@ -1147,6 +1278,7 @@ async function start(intents) {
         }
       }
       await grantXp(msg);
+      await checkSecretCode(msg);
     } catch (e) { log('messageCreate error: ' + e.message); }
   });
 
@@ -1247,6 +1379,91 @@ async function start(intents) {
         const lines = board.map(([id, n], x) => `${medals[x] || `**${x + 1}.**`} <@${id}> — **${n}** invite${n === 1 ? '' : 's'}`);
         await i.reply({ content: `📨 **Invite Leaderboard**\n${lines.join('\n')}`, allowedMentions: { parse: [] } });
 
+      } else if (cmd === 'daily') {
+        const rec = coinRec(i.guildId, i.user.id);
+        const now = Date.now();
+        if (rec.lastDaily && now - rec.lastDaily < 20 * 60 * 60 * 1000) {
+          return i.reply({ content: `⏳ Already claimed — come back <t:${Math.floor((rec.lastDaily + 20 * 60 * 60 * 1000) / 1000)}:R>.`, flags: MessageFlags.Ephemeral });
+        }
+        rec.streak = rec.lastDaily && now - rec.lastDaily < 48 * 60 * 60 * 1000 ? (rec.streak || 0) + 1 : 1;
+        const amount = 100 + Math.min(rec.streak - 1, 10) * 25;
+        rec.coins += amount; rec.lastDaily = now; dirty = true;
+        await i.reply(`💰 Daily claimed: ${fmtC(amount)} (streak: **${rec.streak}** 🔥) — balance ${fmtC(rec.coins)}`);
+
+      } else if (cmd === 'coins') {
+        const target = i.options.getUser('user') || i.user;
+        const rec = coinRec(i.guildId, target.id);
+        await i.reply({ content: `🪙 **${target.username}** has ${fmtC(rec.coins)}`, allowedMentions: { parse: [] } });
+
+      } else if (cmd === 'rich') {
+        const all = Object.entries(state.xp[i.guildId] || {}).filter(([, r]) => r.coins > 0)
+          .sort((a, b) => (b[1].coins || 0) - (a[1].coins || 0)).slice(0, 10);
+        if (!all.length) return i.reply('Nobody has coins yet. `/daily` is free money. 💰');
+        const medals = ['🥇', '🥈', '🥉'];
+        await i.reply({
+          content: `💰 **Richest in the server**\n${all.map(([id, r], n) => `${medals[n] || `**${n + 1}.**`} <@${id}> — ${fmtC(r.coins)}`).join('\n')}`,
+          allowedMentions: { parse: [] },
+        });
+
+      } else if (cmd === 'slots') {
+        const amount = i.options.getInteger('amount', true);
+        const rec = coinRec(i.guildId, i.user.id);
+        if (rec.coins < amount) return i.reply({ content: `You only have ${fmtC(rec.coins)}. 💀`, flags: MessageFlags.Ephemeral });
+        rec.coins -= amount;
+        const { s, win } = spinSlots(amount);
+        rec.coins += win; dirty = true;
+        await i.reply(
+          `🎰 | ${s.join(' | ')} |\n` +
+          (win > amount ? `**JACKPOT-ISH!** +${fmtC(win - amount)} — balance ${fmtC(rec.coins)} 🎉`
+            : win > 0 ? `Pair! +${fmtC(win - amount)} — balance ${fmtC(rec.coins)}`
+            : `Nothing. -${fmtC(amount)} — balance ${fmtC(rec.coins)} 💀`)
+        );
+
+      } else if (cmd === 'flip') {
+        const amount = i.options.getInteger('amount', true);
+        const side = i.options.getString('side', true);
+        const rec = coinRec(i.guildId, i.user.id);
+        if (rec.coins < amount) return i.reply({ content: `You only have ${fmtC(rec.coins)}. 💀`, flags: MessageFlags.Ephemeral });
+        const landed = Math.random() < 0.5 ? 'heads' : 'tails';
+        const won = landed === side;
+        rec.coins += won ? amount : -amount; dirty = true;
+        await i.reply(`🪙 It's **${landed}**! ${won ? `You called it — +${fmtC(amount)}` : `Wrong — -${fmtC(amount)}`} • balance ${fmtC(rec.coins)}`);
+
+      } else if (cmd === 'ship') {
+        const a = i.options.getUser('first', true);
+        const b = i.options.getUser('second') || i.user;
+        const pct = shipScore(a.id, b.id);
+        const bar = '❤️'.repeat(Math.round(pct / 10)) + '🖤'.repeat(10 - Math.round(pct / 10));
+        const verdict = pct >= 90 ? 'MARRIED. It’s decided. 💍' : pct >= 70 ? 'Okay this actually works?? 👀'
+          : pct >= 50 ? 'There’s… something there. Maybe.' : pct >= 30 ? 'Keep it professional. 🤝' : 'Restraining order energy. 🚫';
+        await i.reply({ content: `💘 **${a.username}** × **${b.username}**\n${bar} **${pct}%**\n${verdict}`, allowedMentions: { parse: [] } });
+
+      } else if (cmd === 'roast') {
+        const target = i.options.getUser('who') || i.user;
+        const line = ROASTS[Math.floor(Math.random() * ROASTS.length)];
+        await i.reply({ content: `🔥 <@${target.id}> — ${line}`, allowedMentions: { users: [target.id] } });
+
+      } else if (cmd === 'bet') {
+        const b = state.bet;
+        if (!b || b.status !== 'open') return i.reply({ content: 'No bet is open right now — one opens with every new Gio video. 📈', flags: MessageFlags.Ephemeral });
+        if (Date.now() > b.closesAt) return i.reply({ content: `Betting closed — resolution <t:${Math.floor(b.resolvesAt / 1000)}:R>. 🤞`, flags: MessageFlags.Ephemeral });
+        if (b.wagers[i.user.id]) return i.reply({ content: `You're already in: **${b.wagers[i.user.id].side}** for ${fmtC(b.wagers[i.user.id].amt)}.`, flags: MessageFlags.Ephemeral });
+        const side = i.options.getString('side', true);
+        const amt = i.options.getInteger('amount', true);
+        const rec = coinRec(i.guildId, i.user.id);
+        if (rec.coins < amt) return i.reply({ content: `You only have ${fmtC(rec.coins)}. 💀`, flags: MessageFlags.Ephemeral });
+        rec.coins -= amt;
+        b.wagers[i.user.id] = { side, amt };
+        dirty = true;
+        await i.reply(`📈 Locked in: **${side.toUpperCase()}** ${b.line.toLocaleString()} views for ${fmtC(amt)}. Resolves <t:${Math.floor(b.resolvesAt / 1000)}:R>. 🤞`);
+
+      } else if (cmd === 'setcode') {
+        const code = i.options.getString('code', true).toLowerCase().trim();
+        const max = i.options.getInteger('max') || 10;
+        state.secret = { code, max, claimed: [] };
+        dirty = true;
+        await i.reply({ content: `🗝️ Secret code armed: \`${code}\` — first **${max}** to type it anywhere get the CODEBREAKER role, the vault, and 500 🪙. Their message self-destructs.`, flags: MessageFlags.Ephemeral });
+
       } else if (cmd === 'report') {
         const what = i.options.getString('what', true);
         const who = i.options.getUser('who');
@@ -1346,6 +1563,29 @@ async function registerCommands(client) {
     new SlashCommandBuilder().setName('report').setDescription('Privately report something to the admins')
       .addStringOption((o) => o.setName('what').setDescription('What happened?').setRequired(true).setMaxLength(1000))
       .addUserOption((o) => o.setName('who').setDescription('Who is this about? (optional)')),
+    new SlashCommandBuilder().setName('daily').setDescription('Claim your daily Gio Coins (streaks pay more)'),
+    new SlashCommandBuilder().setName('coins').setDescription('Check a coin balance')
+      .addUserOption((o) => o.setName('user').setDescription('Whose balance?')),
+    new SlashCommandBuilder().setName('rich').setDescription('Richest members leaderboard'),
+    new SlashCommandBuilder().setName('slots').setDescription('Spin the slots 🎰')
+      .addIntegerOption((o) => o.setName('amount').setDescription('Bet (10-5000)').setRequired(true).setMinValue(10).setMaxValue(5000)),
+    new SlashCommandBuilder().setName('flip').setDescription('Coin flip — double or nothing')
+      .addStringOption((o) => o.setName('side').setDescription('Your call').setRequired(true)
+        .addChoices({ name: 'Heads', value: 'heads' }, { name: 'Tails', value: 'tails' }))
+      .addIntegerOption((o) => o.setName('amount').setDescription('Bet (10-5000)').setRequired(true).setMinValue(10).setMaxValue(5000)),
+    new SlashCommandBuilder().setName('ship').setDescription('Ship two people 💘')
+      .addUserOption((o) => o.setName('first').setDescription('First person').setRequired(true))
+      .addUserOption((o) => o.setName('second').setDescription('Second person (default: you)')),
+    new SlashCommandBuilder().setName('roast').setDescription('Get someone roasted by Gio Bot')
+      .addUserOption((o) => o.setName('who').setDescription('The victim (default: you)')),
+    new SlashCommandBuilder().setName('bet').setDescription("Bet on Gio's latest video views 📈")
+      .addStringOption((o) => o.setName('side').setDescription('Over or under the line?').setRequired(true)
+        .addChoices({ name: 'Over', value: 'over' }, { name: 'Under', value: 'under' }))
+      .addIntegerOption((o) => o.setName('amount').setDescription('Coins to stake (10-5000)').setRequired(true).setMinValue(10).setMaxValue(5000)),
+    new SlashCommandBuilder().setName('setcode').setDescription('Set the secret vault code (admins only)')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .addStringOption((o) => o.setName('code').setDescription('The secret word/phrase').setRequired(true).setMaxLength(50))
+      .addIntegerOption((o) => o.setName('max').setDescription('How many people can claim it (default 10)').setMinValue(1).setMaxValue(100)),
     new SlashCommandBuilder().setName('purge').setDescription('Delete recent messages (mods only)')
       .addIntegerOption((o) => o.setName('amount').setDescription('How many (1-100)').setRequired(true).setMinValue(1).setMaxValue(100))
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
