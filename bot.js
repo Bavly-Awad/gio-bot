@@ -58,7 +58,7 @@ function mergeState(f) {
     state.invites[g] = state.invites[g] || {};
     for (const [u, n] of Object.entries(f.invites[g])) state.invites[g][u] = Math.max(state.invites[g][u] || 0, n);
   }
-  for (const k of ['socials', 'qotd', 'growth', 'inviteContest', 'nuke', 'dashMsgId', 'adminRestyled', 'gioOnTop'])
+  for (const k of ['socials', 'qotd', 'growth', 'inviteContest', 'nuke', 'dashMsgId', 'adminRestyled', 'gioOnTop', 'secret', 'bet', 'memeContest'])
     if (state[k] === undefined && f[k] !== undefined) state[k] = f[k];
 }
 
