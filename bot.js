@@ -694,6 +694,65 @@ async function inviteContestTick(client) {
   } catch (e) { log('invite contest error: ' + e.message); }
 }
 
+// ---------- 3-day meme challenge (one-shot, self-running) ----------
+const MEME_CONTEST = {
+  start: Date.parse('2026-07-18T00:00:00Z'),
+  end: Date.parse('2026-07-21T00:00:00Z'), // 3 days
+};
+
+async function memeContestTick(client) {
+  try {
+    const s = (state.memeContest = state.memeContest || {});
+    const guild = await client.guilds.fetch(GUILDS[0]);
+    const memes = guild.channels.cache.find((c) => c.name.includes('new-memes'));
+    if (!memes) return;
+
+    if (!s.announced) {
+      const ann = guild.channels.cache.find((c) => c.name.includes('「📢」announcements'));
+      const endTs = Math.floor(MEME_CONTEST.end / 1000);
+      if (ann) await ann.send({
+        content: `@everyone\n# 😂 MEME CHALLENGE — 3 DAYS. BEST MEME WINS.\n\nDrop your best Gio meme in ${memes} before <t:${endTs}:F> (<t:${endTs}:R>).\n\n> 🔥 React to the ones that cook you\n> 🏆 Most reactions wins the **🏆 Legend** role + a shoutout\n> 😤 Original memes only\n\nCook. That's the whole announcement.`,
+        allowedMentions: { parse: ['everyone'] },
+      });
+      await memes.send({ content: `# 😂 THE MEME CHALLENGE IS LIVE — this is the arena. <t:${Math.floor(MEME_CONTEST.end / 1000)}:R> the winner is crowned. 🏆`, allowedMentions: { parse: [] } });
+      s.announced = true; dirty = true;
+      log('meme contest announced');
+      return;
+    }
+
+    if (s.resolved || Date.now() < MEME_CONTEST.end) return;
+
+    // resolve: highest-reacted qualifying meme posted during the window
+    let entries = [], before;
+    for (let page = 0; page < 4; page++) {
+      const batch = await memes.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (!batch.size) break;
+      for (const m of batch.values()) {
+        const t = m.createdTimestamp;
+        if (t < MEME_CONTEST.start) { page = 99; break; }
+        if (t <= MEME_CONTEST.end && !m.author.bot &&
+            (m.attachments.size > 0 || m.embeds.length > 0)) entries.push(m);
+      }
+      before = batch.last()?.id;
+    }
+    const score = (m) => [...m.reactions.cache.values()].reduce((s2, r) => s2 + r.count, 0);
+    const ann = guild.channels.cache.find((c) => c.name.includes('「📢」announcements'));
+    if (!entries.length) {
+      if (ann) await ann.send('😂 The meme challenge ended with no entries... embarrassing, honestly. Next time. 💀');
+    } else {
+      const winner = entries.reduce((a, b) => (score(b) > score(a) ? b : a));
+      const legend = guild.roles.cache.find((r) => r.name.includes('Legend'));
+      if (legend) await guild.members.fetch(winner.author.id).then((m) => m.roles.add(legend)).catch(() => {});
+      if (ann) await ann.send({
+        content: `# 😂 MEME CHALLENGE — WE HAVE A WINNER\n\n🏆 <@${winner.author.id}> takes it with **${score(winner)} reactions**!\n${winner.url}\n\nThey now hold the **🏆 Legend** role. Bow down. 👑`,
+        allowedMentions: { users: [winner.author.id] },
+      });
+      log(`meme contest won by ${winner.author.username} (${score(winner)})`);
+    }
+    s.resolved = true; dirty = true;
+  } catch (e) { log('meme contest error: ' + e.message); }
+}
+
 // ---------- welcome bookkeeping ----------
 // One welcome per member, ever. Backed by state so it survives restarts and the
 // brief old+new instance overlap during Render deploys.
@@ -1041,7 +1100,7 @@ async function start(intents) {
       const guild = await client.guilds.fetch(gid).catch(() => null);
       if (guild) await cacheInvites(guild);
     }
-    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); inviteContestTick(client); saveState(); };
+    const tick = () => { growthTick(client); qotdTick(client); hangoutTick(client); inviteContestTick(client); memeContestTick(client); saveState(); };
     tick(); setInterval(tick, 5 * 60 * 1000);
 
     // Social alerts get their own, faster timer — this is the latency users actually feel.
@@ -1188,6 +1247,35 @@ async function start(intents) {
         const lines = board.map(([id, n], x) => `${medals[x] || `**${x + 1}.**`} <@${id}> — **${n}** invite${n === 1 ? '' : 's'}`);
         await i.reply({ content: `📨 **Invite Leaderboard**\n${lines.join('\n')}`, allowedMentions: { parse: [] } });
 
+      } else if (cmd === 'report') {
+        const what = i.options.getString('what', true);
+        const who = i.options.getUser('who');
+        const reportText =
+          `🚨 **New report**\n` +
+          `**From:** ${i.user.tag} (<@${i.user.id}>)\n` +
+          (who ? `**About:** ${who.tag} (<@${who.id}>)\n` : '') +
+          `**Where:** ${i.channel}\n` +
+          `**What:** ${what}\n` +
+          `-# <t:${Math.floor(Date.now() / 1000)}:f>`;
+        let delivered = false;
+        // straight to the founder's DMs
+        try {
+          const founder = await client.users.fetch(FOUNDER);
+          await founder.send({ content: reportText, allowedMentions: { parse: [] } });
+          delivered = true;
+        } catch (e) { log('report DM failed: ' + e.message); }
+        // mirror to mod-logs so it's never lost
+        try {
+          const logsCh = i.guild.channels.cache.find((c) => c.name.includes('mod-logs'));
+          if (logsCh) { await logsCh.send({ content: reportText, allowedMentions: { parse: [] } }); delivered = true; }
+        } catch {}
+        await i.reply({
+          content: delivered
+            ? '✅ Report sent privately to the admins. Thank you for keeping the server safe — nobody else can see this.'
+            : '⚠️ Could not deliver your report right now — please DM a mod directly.',
+          flags: MessageFlags.Ephemeral,
+        });
+
       } else if (cmd === 'antinuke') {
         const me = await i.guild.members.fetchMe();
         const myPos = me.roles.highest.position;
@@ -1255,6 +1343,9 @@ async function registerCommands(client) {
     new SlashCommandBuilder().setName('invites').setDescription('Who has invited the most people'),
     new SlashCommandBuilder().setName('antinuke').setDescription('Anti-nuke protection status (admins only)')
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName('report').setDescription('Privately report something to the admins')
+      .addStringOption((o) => o.setName('what').setDescription('What happened?').setRequired(true).setMaxLength(1000))
+      .addUserOption((o) => o.setName('who').setDescription('Who is this about? (optional)')),
     new SlashCommandBuilder().setName('purge').setDescription('Delete recent messages (mods only)')
       .addIntegerOption((o) => o.setName('amount').setDescription('How many (1-100)').setRequired(true).setMinValue(1).setMaxValue(100))
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
