@@ -150,9 +150,15 @@ async function grantXp(msg) {
   rec.xp += gain; rec.total += gain;
   rec.coins = (rec.coins == null ? 100 : rec.coins) + 3 + Math.floor(Math.random() * 5);
   dirty = true;
+  let announcedLevelUp = false;
   while (rec.xp >= xpToNext(rec.level)) {
     rec.xp -= xpToNext(rec.level);
     rec.level++;
+    // Announce each level ONCE ever. If a restart rolled XP back and someone
+    // re-crosses a boundary, they re-level silently — no repeat congratulations.
+    if (rec.level <= (rec.maxLevel || 0)) continue;
+    rec.maxLevel = rec.level;
+    announcedLevelUp = true;
     await msg.channel.send({
       content: `🎉 <@${u}> just hit **Level ${rec.level}**! 👑`,
       allowedMentions: { users: [u] },
@@ -169,6 +175,9 @@ async function grantXp(msg) {
       }
     }
   }
+  // Persist immediately on level-up so a crash/deploy can never roll anyone
+  // back across a level boundary (the root cause of repeat announcements).
+  if (announcedLevelUp) await saveState().catch(() => {});
 }
 
 // ---------- QOTD ----------
@@ -1223,6 +1232,13 @@ async function start(intents) {
       state.xp[gid] = state.xp[gid] || {};
       const rec = (state.xp[gid][FOUNDER] = state.xp[gid][FOUNDER] || { xp: 0, level: 0, last: 0, total: 0 });
       if (rec.level < 100) { rec.level = 100; rec.total = Math.max(rec.total, 1899250); dirty = true; log('founder boost applied'); }
+    }
+    // announce-once ledger: treat everyone's current level as already announced,
+    // so nobody gets a repeat "you hit Level N" from pre-fix history
+    for (const gid of GUILDS) {
+      for (const rec of Object.values(state.xp[gid] || {})) {
+        if ((rec.maxLevel || 0) < rec.level) { rec.maxLevel = rec.level; dirty = true; }
+      }
     }
     await registerCommands(client);
     await welcomeCatchUp(client);
